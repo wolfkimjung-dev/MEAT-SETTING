@@ -1,0 +1,3974 @@
+import os
+import sys
+import re
+import io
+import json
+import sqlite3
+import webbrowser
+import threading
+from datetime import datetime, date, timedelta
+from flask import Flask, request, jsonify, render_template_string, send_file
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+app = Flask(__name__)
+
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH = os.path.join(BASE_DIR, "meat_stock.db")
+
+CATALOG = {
+    "돼지고기": {
+        "삼겹살": [
+            "삼겹살 / PORK BELLY", "꽃삼겹살 / Flower Pork Belly", "전지살 / PORK CUBE",
+            "PORK SCRAP", "뼈 버릴것", "생삼겹살 / Fresh Pork Meat", "할인삼겹",
+            "삼겹살 프로모 세트", "시식 삼겹", "갈은 돼지고기 / GROUND PORK"
+        ],
+        "목살": ["목살 / MOKSAL", "목살 제육용 / JEYUK"],
+        "기타": ["등심 / PORK LOIN", "항정살 / JOWLS", "등갈비 / BACK RIB", "갈비 / SPARE RIB", "족발 앞다리 살 / PATA FRONT"]
+    },
+    "소고기": {
+        "불고기": [
+            "불고기 / BULGOGI", "쇠고기 잡채용 / BEEF JARCHE",
+            "쇠고기 국거리 / BEEF BOIL", "소불고기 프로모 세트 / Beef Bulgogi Promo Set"
+        ],
+        "일반": [
+            "불고기US / BULGOGI US", "갈비살 미국산 / US RIB FINGER", "갈비살 / RIB FINGER",
+            "BEEF SCRAP", "우삼겹 / SHORT PLATE", "차돌박이 / BRISKET",
+            "꽃살 / SHORT RIBS BONELESS", "소등심 / RIB EYE", "소안심 / TENDERLOIN",
+            "낙엽살 / TOP BLADE", "부채살 / TOP BLADE US", "살치살",
+            "쇠고기 등갈비 / BEEF BACK RIBS", "LA 갈비 / SHORT RIB BONE",
+            "갈비 / GALBI", "사골 / BONE MARROW", "쇠고기 갈은것 / GROUND BEEF",
+            "소꼬리 / OXTAIL", "도가니 / BEEF TENDON"
+        ]
+    },
+    "닭고기": {
+        "기본": [
+            "닭가슴살 / CHICKEN BREAST", "닭다리살 / CHICKEN THIGH", "드럼스틱 / DRUMSTICK",
+            "닭날개 / CHICKEN WING", "닭안심 / CHICKEN TENDER", "닭볶음탕용 / CHICKEN CUT"
+        ]
+    }
+}
+
+def normalize_key(s):
+    if not s:
+        return ""
+    return re.sub(r'[\s_\-/]+', '', str(s).lower())
+
+def num(v):
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).replace(',', '').replace('₱', '').replace('₩', '').replace('원', '').replace('$', '').strip()
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("INSERT OR IGNORE INTO settings (k, v) VALUES ('fixed_loss_rate', '20.0')")
+    c.execute("INSERT OR IGNORE INTO settings (k, v) VALUES ('margin_rate', '35.0')")
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        name_key TEXT NOT NULL,
+        barcode TEXT DEFAULT '',
+        category TEXT DEFAULT '돼지고기',
+        cut TEXT DEFAULT '',
+        stock_kind TEXT DEFAULT 'pack',
+        buy_price_100g REAL DEFAULT 0,
+        buy_price_kg REAL DEFAULT 0,
+        adjusted_price REAL DEFAULT 0,
+        sale_per_kg REAL DEFAULT 0,
+        slab_stock_kg REAL DEFAULT 0,
+        pack_stock_kg REAL DEFAULT 0,
+        pack_count INTEGER DEFAULT 0,
+        min_stock_kg REAL DEFAULT 7.0,
+        active INTEGER DEFAULT 1
+    )""")
+
+    p_cols = [r["name"] for r in c.execute("PRAGMA table_info(products)").fetchall()]
+    if "min_stock_kg" not in p_cols:
+        c.execute("ALTER TABLE products ADD COLUMN min_stock_kg REAL DEFAULT 7.0")
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS slabs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        meat_type TEXT NOT NULL,
+        cut TEXT DEFAULT '',
+        product_id INTEGER,
+        slab_no TEXT DEFAULT '',
+        kg REAL DEFAULT 0,
+        remaining_kg REAL DEFAULT 0,
+        buy_price_100g REAL DEFAULT 0,
+        buy_price_kg REAL DEFAULT 0,
+        is_carryover INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'open'
+    )""")
+
+    s_cols = [r["name"] for r in c.execute("PRAGMA table_info(slabs)").fetchall()]
+    if "is_carryover" not in s_cols:
+        c.execute("ALTER TABLE slabs ADD COLUMN is_carryover INTEGER DEFAULT 0")
+    if "product_id" not in s_cols:
+        c.execute("ALTER TABLE slabs ADD COLUMN product_id INTEGER")
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS movements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        type TEXT NOT NULL,
+        product_id INTEGER,
+        slab_id INTEGER,
+        meat_type TEXT DEFAULT '',
+        qty INTEGER DEFAULT 0,
+        kg_delta REAL DEFAULT 0,
+        slab_kg_delta REAL DEFAULT 0,
+        pack_kg_delta REAL DEFAULT 0,
+        pack_delta INTEGER DEFAULT 0,
+        loss_kg REAL DEFAULT 0,
+        trim_kg REAL DEFAULT 0,
+        waste_kg REAL DEFAULT 0,
+        unit_price REAL DEFAULT 0,
+        amount REAL DEFAULT 0,
+        price_per_kg REAL DEFAULT 0,
+        note TEXT DEFAULT ''
+    )""")
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sales_imports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT NOT NULL,
+        sheet_name TEXT NOT NULL,
+        sheet_date TEXT NOT NULL,
+        deduct_date TEXT NOT NULL,
+        imported_at TEXT NOT NULL,
+        total_qty INTEGER DEFAULT 0,
+        total_kg REAL DEFAULT 0,
+        total_amount REAL DEFAULT 0,
+        status TEXT DEFAULT 'done'
+    )""")
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        action_label TEXT NOT NULL,
+        payload TEXT NOT NULL
+    )""")
+
+    cnt = c.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    if cnt == 0:
+        for meat, cuts in CATALOG.items():
+            for cut, names in cuts.items():
+                for nm in names:
+                    c.execute(
+                        "INSERT INTO products (name, name_key, category, cut, stock_kind, min_stock_kg) VALUES (?, ?, ?, ?, 'pack', 7.0)",
+                        (nm, normalize_key(nm), meat, cut)
+                    )
+    conn.commit()
+    conn.close()
+
+def resolve_slab_product(conn, product_id, meat_type, cut):
+    if product_id:
+        p = conn.execute("SELECT * FROM products WHERE id=?", (int(num(product_id)),)).fetchone()
+        if p:
+            return p
+    if cut:
+        ck = normalize_key(cut)
+        p = conn.execute(
+            "SELECT * FROM products WHERE category=? AND (name_key LIKE ? OR cut LIKE ?) ORDER BY id ASC LIMIT 1",
+            (meat_type, f"%{ck}%", f"%{cut}%")
+        ).fetchone()
+        if p:
+            return p
+    return conn.execute("SELECT * FROM products WHERE category=? ORDER BY id ASC LIMIT 1", (meat_type,)).fetchone()
+
+def calc_prices(buy_100g, fixed_loss_pct=20.0, margin_pct=35.0):
+    buy_100g = num(buy_100g)
+    buy_kg = round(buy_100g * 10.0, 2)
+    loss_factor = max(0.05, 1.0 - (num(fixed_loss_pct) / 100.0))
+    adj_price = round(buy_kg / loss_factor, 2)
+    sale_price = round(adj_price * (1.0 + (num(margin_pct) / 100.0)), 2)
+    return buy_kg, adj_price, sale_price
+
+def save_snapshot(conn, label):
+    payload = json.dumps({
+        "products": [dict(r) for r in conn.execute("SELECT * FROM products").fetchall()],
+        "slabs": [dict(r) for r in conn.execute("SELECT * FROM slabs").fetchall()],
+        "movements": [dict(r) for r in conn.execute("SELECT * FROM movements").fetchall()],
+        "sales_imports": [dict(r) for r in conn.execute("SELECT * FROM sales_imports").fetchall()],
+        "settings": [dict(r) for r in conn.execute("SELECT * FROM settings").fetchall()]
+    }, ensure_ascii=False)
+    conn.execute(
+        "INSERT INTO snapshots (created_at, action_label, payload) VALUES (?, ?, ?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), label, payload)
+    )
+    conn.execute("DELETE FROM snapshots WHERE id NOT IN (SELECT id FROM snapshots ORDER BY id DESC LIMIT 30)")
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+@app.route("/api/state", methods=["GET"])
+def api_state():
+    conn = get_db()
+    settings = {r["k"]: r["v"] for r in conn.execute("SELECT * FROM settings").fetchall()}
+    products = [dict(r) for r in conn.execute("SELECT * FROM products WHERE active=1 ORDER BY category, cut, name").fetchall()]
+    slabs = [dict(r) for r in conn.execute(
+        "SELECT * FROM slabs ORDER BY CASE WHEN remaining_kg <= 0.0001 THEN 1 ELSE 0 END ASC, date DESC, id DESC"
+    ).fetchall()]
+    movements = [dict(r) for r in conn.execute("SELECT * FROM movements ORDER BY date DESC, id DESC LIMIT 2000").fetchall()]
+    sales_imports = [dict(r) for r in conn.execute("SELECT * FROM sales_imports ORDER BY id DESC").fetchall()]
+    snapshots = [dict(r) for r in conn.execute("SELECT id, created_at, action_label FROM snapshots ORDER BY id DESC").fetchall()]
+    conn.close()
+    return jsonify({
+        "settings": settings,
+        "catalog": CATALOG,
+        "products": products,
+        "slabs": slabs,
+        "movements": movements,
+        "sales_imports": sales_imports,
+        "snapshots": snapshots,
+        "db_path": DB_PATH,
+        "server_ts": datetime.now().strftime("%H:%M:%S")
+    })
+
+@app.route("/api/settings", methods=["POST"])
+def api_settings():
+    data = request.json or {}
+    conn = get_db()
+    save_snapshot(conn, "설정(보정로스율/마진율) 변경")
+    if "fixed_loss_rate" in data:
+        conn.execute("INSERT OR REPLACE INTO settings (k, v) VALUES ('fixed_loss_rate', ?)", (str(num(data["fixed_loss_rate"])),))
+    if "margin_rate" in data:
+        conn.execute("INSERT OR REPLACE INTO settings (k, v) VALUES ('margin_rate', ?)", (str(num(data["margin_rate"])),))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/undo", methods=["POST"])
+def api_undo():
+    data = request.json or {}
+    snap_id = data.get("snapshot_id")
+    conn = get_db()
+    if snap_id:
+        row = conn.execute("SELECT * FROM snapshots WHERE id=?", (snap_id,)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"ok": False, "error": "복구할 이전 단계가 없습니다."})
+
+    payload = json.loads(row["payload"])
+    for tbl in ["products", "slabs", "movements", "sales_imports", "settings"]:
+        conn.execute(f"DELETE FROM {tbl}")
+        for r in payload.get(tbl, []):
+            cols = list(r.keys())
+            conn.execute(f"INSERT INTO {tbl} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", [r[c] for c in cols])
+
+    conn.execute("DELETE FROM snapshots WHERE id >= ?", (row["id"],))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "label": row["action_label"]})
+
+@app.route("/api/products/save", methods=["POST"])
+def api_product_save():
+    d = request.json or {}
+    conn = get_db()
+    settings = {r["k"]: r["v"] for r in conn.execute("SELECT * FROM settings").fetchall()}
+    fixed_loss = num(settings.get("fixed_loss_rate", 20))
+    margin = num(settings.get("margin_rate", 35))
+
+    pid = d.get("id")
+    name = str(d.get("name", "")).strip()
+    if not name:
+        conn.close()
+        return jsonify({"ok": False, "error": "상품명을 입력하세요."})
+
+    buy_100g = num(d.get("buy_price_100g"))
+    buy_kg, adj_price, auto_sale = calc_prices(buy_100g, fixed_loss, margin)
+    if num(d.get("adjusted_price")) > 0:
+        adj_price = num(d.get("adjusted_price"))
+    sale_per_kg = num(d.get("sale_per_kg")) if num(d.get("sale_per_kg")) > 0 else auto_sale
+
+    slab_kg = num(d.get("slab_stock_kg"))
+    pack_kg = num(d.get("pack_stock_kg"))
+    pack_cnt = int(num(d.get("pack_count")))
+    min_stock_kg = 7.0
+    barcode = str(d.get("barcode", "")).strip()
+    category = str(d.get("category", "돼지고기")).strip()
+    cut = str(d.get("cut", "")).strip()
+    stock_kind = str(d.get("stock_kind", "pack")).strip()
+
+    save_snapshot(conn, f"상품 {'수정' if pid else '등록'}: {name}")
+    if pid:
+        conn.execute("""
+            UPDATE products SET name=?, name_key=?, barcode=?, category=?, cut=?, stock_kind=?,
+            buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?,
+            slab_stock_kg=?, pack_stock_kg=?, pack_count=?, min_stock_kg=?
+            WHERE id=?
+        """, (name, normalize_key(name), barcode, category, cut, stock_kind,
+              buy_100g, buy_kg, adj_price, sale_per_kg, slab_kg, pack_kg, pack_cnt, min_stock_kg, pid))
+    else:
+        conn.execute("""
+            INSERT INTO products (name, name_key, barcode, category, cut, stock_kind,
+            buy_price_100g, buy_price_kg, adjusted_price, sale_per_kg, slab_stock_kg, pack_stock_kg, pack_count, min_stock_kg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (name, normalize_key(name), barcode, category, cut, stock_kind,
+              buy_100g, buy_kg, adj_price, sale_per_kg, slab_kg, pack_kg, pack_cnt, min_stock_kg))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/products/receive", methods=["POST"])
+def api_product_receive():
+    d = request.json or {}
+    conn = get_db()
+    settings = {r["k"]: r["v"] for r in conn.execute("SELECT * FROM settings").fetchall()}
+    fixed_loss = num(settings.get("fixed_loss_rate", 20))
+    margin = num(settings.get("margin_rate", 35))
+
+    pid = int(num(d.get("product_id")))
+    rec_date = str(d.get("date") or date.today().isoformat())
+    target_type = str(d.get("target_type") or "pack")
+    in_kg = num(d.get("kg"))
+    in_packs = int(num(d.get("packs")))
+    loss_kg = num(d.get("loss_kg"))
+    buy_100g = num(d.get("buy_price_100g"))
+    is_carryover = 1 if d.get("is_carryover") else 0
+
+    prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not prod or (in_kg <= 0 and loss_kg <= 0):
+        conn.close()
+        return jsonify({"ok": False, "error": "상품과 입고 중량(또는 로스)을 입력하세요."})
+
+    save_snapshot(conn, f"상품 {'전월이월' if is_carryover else '입고'}: {prod['name']} ({in_kg}kg)")
+    if buy_100g > 0:
+        buy_kg, adj_price, sale_price = calc_prices(buy_100g, fixed_loss, margin)
+    else:
+        buy_100g = prod["buy_price_100g"]
+        buy_kg = prod["buy_price_kg"]
+        adj_price = prod["adjusted_price"]
+        sale_price = prod["sale_per_kg"]
+
+    net_kg = round(in_kg - loss_kg, 3)
+    new_slab_kg = round(prod["slab_stock_kg"] + (net_kg if target_type == "slab" else 0.0), 3)
+    new_pack_kg = round(prod["pack_stock_kg"] + (net_kg if target_type == "pack" else 0.0), 3)
+    new_pack_cnt = prod["pack_count"] + (in_packs if target_type == "pack" else 0)
+
+    conn.execute("""
+        UPDATE products SET buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?,
+        slab_stock_kg=?, pack_stock_kg=?, pack_count=? WHERE id=?
+    """, (buy_100g, buy_kg, adj_price, sale_price, new_slab_kg, new_pack_kg, new_pack_cnt, pid))
+
+    mov_type = "carryover_inbound" if is_carryover else "product_receiving"
+    note_prefix = "전월이월 재고등록" if is_carryover else "상품 입고"
+    total_amount = round(in_kg * buy_kg, 2)
+    conn.execute("""
+        INSERT INTO movements (date, created_at, type, product_id, meat_type, qty, kg_delta,
+        slab_kg_delta, pack_kg_delta, pack_delta, loss_kg, unit_price, amount, price_per_kg, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (rec_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mov_type, pid, prod["category"],
+          in_packs, net_kg,
+          net_kg if target_type == "slab" else 0.0,
+          net_kg if target_type == "pack" else 0.0,
+          in_packs if target_type == "pack" else 0,
+          loss_kg, buy_kg, total_amount, buy_kg,
+          f"{note_prefix} (총 {in_kg}kg / 로스 {loss_kg}kg / 순반영 {net_kg}kg)"))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/products/receive/update", methods=["POST"])
+def api_product_receive_update():
+    d = request.json or {}
+    mid = int(num(d.get("id")))
+    rec_date = str(d.get("date") or date.today().isoformat())
+    new_pid = int(num(d.get("product_id")))
+    target_type = str(d.get("target_type") or "pack")
+    in_kg = num(d.get("kg"))
+    in_packs = int(num(d.get("packs")))
+    loss_kg = num(d.get("loss_kg"))
+    buy_100g = num(d.get("buy_price_100g"))
+    is_carryover = 1 if d.get("is_carryover") else 0
+
+    conn = get_db()
+    m = conn.execute("SELECT * FROM movements WHERE id=? AND type IN ('product_receiving', 'carryover_inbound')", (mid,)).fetchone()
+    if not m:
+        conn.close()
+        return jsonify({"ok": False, "error": "수정할 상품 입고 이력을 찾을 수 없습니다."})
+
+    new_prod = conn.execute("SELECT * FROM products WHERE id=?", (new_pid,)).fetchone()
+    if not new_prod or (in_kg <= 0 and loss_kg <= 0):
+        conn.close()
+        return jsonify({"ok": False, "error": "상품과 입고 중량(또는 로스)을 입력하세요."})
+
+    settings = {r["k"]: r["v"] for r in conn.execute("SELECT * FROM settings").fetchall()}
+    fixed_loss = num(settings.get("fixed_loss_rate", 20))
+    margin = num(settings.get("margin_rate", 35))
+
+    save_snapshot(conn, f"상품입고 이력 수정: #{mid}")
+
+    old_pid = m["product_id"]
+    if old_pid:
+        old_prod = conn.execute("SELECT * FROM products WHERE id=?", (old_pid,)).fetchone()
+        if old_prod:
+            r_pack_kg = round(old_prod["pack_stock_kg"] - abs(m["pack_kg_delta"] or 0), 3)
+            r_slab_kg = round(old_prod["slab_stock_kg"] - abs(m["slab_kg_delta"] or 0), 3)
+            r_cnt = old_prod["pack_count"] - abs(m["pack_delta"] or 0)
+            conn.execute(
+                "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                (r_pack_kg, r_slab_kg, r_cnt, old_pid)
+            )
+
+    fresh_prod = conn.execute("SELECT * FROM products WHERE id=?", (new_pid,)).fetchone()
+    if buy_100g > 0:
+        buy_kg, adj_price, sale_price = calc_prices(buy_100g, fixed_loss, margin)
+    else:
+        buy_100g = fresh_prod["buy_price_100g"]
+        buy_kg = fresh_prod["buy_price_kg"]
+        adj_price = fresh_prod["adjusted_price"]
+        sale_price = fresh_prod["sale_per_kg"]
+
+    net_kg = round(in_kg - loss_kg, 3)
+    u_slab_kg = round(fresh_prod["slab_stock_kg"] + (net_kg if target_type == "slab" else 0.0), 3)
+    u_pack_kg = round(fresh_prod["pack_stock_kg"] + (net_kg if target_type == "pack" else 0.0), 3)
+    u_pack_cnt = fresh_prod["pack_count"] + (in_packs if target_type == "pack" else 0)
+
+    conn.execute("""
+        UPDATE products SET buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?,
+        slab_stock_kg=?, pack_stock_kg=?, pack_count=? WHERE id=?
+    """, (buy_100g, buy_kg, adj_price, sale_price, u_slab_kg, u_pack_kg, u_pack_cnt, new_pid))
+
+    mov_type = "carryover_inbound" if is_carryover else "product_receiving"
+    note_prefix = "전월이월 재고등록(수정)" if is_carryover else "상품 입고(수정)"
+    total_amount = round(in_kg * buy_kg, 2)
+    conn.execute("""
+        UPDATE movements SET date=?, type=?, product_id=?, meat_type=?, qty=?, kg_delta=?,
+        slab_kg_delta=?, pack_kg_delta=?, pack_delta=?, loss_kg=?, unit_price=?, amount=?, price_per_kg=?, note=?
+        WHERE id=?
+    """, (rec_date, mov_type, new_pid, fresh_prod["category"], in_packs, net_kg,
+          net_kg if target_type == "slab" else 0.0,
+          net_kg if target_type == "pack" else 0.0,
+          in_packs if target_type == "pack" else 0,
+          loss_kg, buy_kg, total_amount, buy_kg,
+          f"{note_prefix} (총 {in_kg}kg / 로스 {loss_kg}kg / 순반영 {net_kg}kg)", mid))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/slabs/receive", methods=["POST"])
+def api_slab_receive():
+    d = request.json or {}
+    conn = get_db()
+    sid = d.get("id")
+    s_date = str(d.get("date") or date.today().isoformat())
+    meat_type = str(d.get("meat_type") or "돼지고기")
+    cut = str(d.get("cut") or "").strip()
+    slab_no = str(d.get("slab_no") or "").strip()
+    kg = num(d.get("kg"))
+    buy_100g = num(d.get("buy_price_100g"))
+    buy_kg = round(buy_100g * 10.0, 2)
+    is_carryover = 1 if d.get("is_carryover") else 0
+    
+    linked_prod = resolve_slab_product(conn, d.get("product_id"), meat_type, cut)
+    linked_pid = linked_prod["id"] if linked_prod else None
+
+    if kg <= 0:
+        conn.close()
+        return jsonify({"ok": False, "error": "슬랍 중량(KG)을 입력하세요."})
+
+    label_tag = "전월이월 슬랍" if is_carryover else "슬랍 입고"
+    save_snapshot(conn, f"{label_tag} {'수정' if sid else '등록'}: {slab_no or cut} ({kg}kg)")
+
+    if sid:
+        old = conn.execute("SELECT * FROM slabs WHERE id=?", (sid,)).fetchone()
+        if not old:
+            conn.close()
+            return jsonify({"ok": False, "error": "수정할 슬랍을 찾을 수 없습니다."})
+
+        old_pid = old["product_id"]
+        if not old_pid:
+            mp = resolve_slab_product(conn, None, old["meat_type"], old["cut"])
+            if mp: old_pid = mp["id"]
+
+        if old_pid and old["remaining_kg"] != 0:
+            conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg - ?, 3) WHERE id=?",
+                         (old["remaining_kg"], old_pid))
+
+        consumed_kg = old["kg"] - old["remaining_kg"]
+        new_rem = round(kg - consumed_kg, 3)
+        status = "done" if new_rem <= 0.0001 else "open"
+
+        if linked_pid:
+            conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg + ?, 3) WHERE id=?",
+                         (new_rem, linked_pid))
+
+        conn.execute("""
+            UPDATE slabs SET date=?, meat_type=?, cut=?, product_id=?, slab_no=?, kg=?, remaining_kg=?,
+            buy_price_100g=?, buy_price_kg=?, is_carryover=?, status=? WHERE id=?
+        """, (s_date, meat_type, cut, linked_pid, slab_no, kg, new_rem, buy_100g, buy_kg, is_carryover, status, sid))
+        
+        mov_type = "slab_carryover" if is_carryover else "slab_inbound"
+        conn.execute("""
+            UPDATE movements SET date=?, type=?, product_id=?, meat_type=?, kg_delta=?, slab_kg_delta=?,
+            unit_price=?, amount=?, price_per_kg=?, note=?
+            WHERE slab_id=? AND type IN ('slab_inbound', 'slab_carryover')
+        """, (s_date, mov_type, linked_pid, meat_type, kg, kg, buy_kg, round(kg * buy_kg, 2), buy_kg,
+              f"{label_tag} ({slab_no or cut})", sid))
+    else:
+        cur = conn.execute("""
+            INSERT INTO slabs (date, meat_type, cut, product_id, slab_no, kg, remaining_kg, buy_price_100g, buy_price_kg, is_carryover, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+        """, (s_date, meat_type, cut, linked_pid, slab_no, kg, kg, buy_100g, buy_kg, is_carryover))
+        new_sid = cur.lastrowid
+        
+        if linked_pid:
+            conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg + ?, 3) WHERE id=?", (kg, linked_pid))
+        
+        mov_type = "slab_carryover" if is_carryover else "slab_inbound"
+        conn.execute("""
+            INSERT INTO movements (date, created_at, type, product_id, slab_id, meat_type, qty, kg_delta, slab_kg_delta, unit_price, amount, price_per_kg, note)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+        """, (s_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mov_type, linked_pid, new_sid, meat_type,
+              kg, kg, buy_kg, round(kg * buy_kg, 2), buy_kg, f"{label_tag} ({slab_no or cut})"))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/slabs/delete", methods=["POST"])
+def api_slab_delete():
+    d = request.json or {}
+    sid = d.get("id")
+    conn = get_db()
+    slab = conn.execute("SELECT * FROM slabs WHERE id=?", (sid,)).fetchone()
+    if not slab:
+        conn.close()
+        return jsonify({"ok": False, "error": "삭제할 슬랍을 찾을 수 없습니다."})
+    save_snapshot(conn, f"슬랍 삭제: #{slab['slab_no'] or slab['id']}")
+    
+    t_pid = slab["product_id"]
+    if not t_pid:
+        mp = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
+        if mp: t_pid = mp["id"]
+
+    if t_pid and slab["remaining_kg"] != 0:
+        conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg - ?, 3) WHERE id=?",
+                     (slab["remaining_kg"], t_pid))
+
+    conn.execute("DELETE FROM movements WHERE slab_id=?", (sid,))
+    conn.execute("DELETE FROM slabs WHERE id=?", (sid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/slabs/production", methods=["POST"])
+def api_slab_production():
+    d = request.json or {}
+    conn = get_db()
+    p_date = str(d.get("date") or date.today().isoformat())
+    slab_id = int(num(d.get("slab_id")))
+    product_id = int(num(d.get("product_id")))
+    input_kg = num(d.get("input_kg"))
+    pack_unit_kg = num(d.get("pack_unit_kg"))
+    packs = int(num(d.get("packs")))
+    out_kg = round(pack_unit_kg * packs, 3) if pack_unit_kg > 0 and packs > 0 else num(d.get("output_kg"))
+
+    slab = conn.execute("SELECT * FROM slabs WHERE id=?", (slab_id,)).fetchone()
+    prod = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not slab or not prod or input_kg <= 0:
+        conn.close()
+        return jsonify({"ok": False, "error": "입고 날짜별 슬랍과 생산 상품, 투입 KG를 정확히 입력하세요."})
+
+    save_snapshot(conn, f"슬랍 생산반영: {slab['slab_no']} -> {prod['name']}")
+    rem = round(slab["remaining_kg"] - input_kg, 3)
+    status = "done" if rem <= 0.0001 else "open"
+
+    conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (rem, status, slab_id))
+    
+    target_slab_pid = slab.get("product_id")
+    if not target_slab_pid:
+        match_p = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
+        if match_p:
+            target_slab_pid = match_p["id"]
+    
+    if target_slab_pid:
+        conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg - ?, 3) WHERE id=?",
+                     (input_kg, target_slab_pid))
+
+    conn.execute("UPDATE products SET pack_stock_kg = ROUND(pack_stock_kg + ?, 3), pack_count = pack_count + ? WHERE id=?",
+                 (out_kg, packs, product_id))
+
+    conn.execute("""
+        INSERT INTO movements (date, created_at, type, product_id, slab_id, meat_type, qty, kg_delta,
+        slab_kg_delta, pack_kg_delta, pack_delta, loss_kg, unit_price, amount, price_per_kg, note)
+        VALUES (?, ?, 'slab_production', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+    """, (p_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), product_id, slab_id, slab["meat_type"],
+          packs, out_kg, -input_kg, out_kg, packs,
+          slab["buy_price_kg"], round(out_kg * prod["sale_per_kg"], 2), prod["sale_per_kg"],
+          f"생산반영 (슬랍 #{slab['slab_no'] or slab['id']} 투입 {input_kg}kg -> {packs}팩/{out_kg}kg)"))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/slabs/production/update", methods=["POST"])
+def api_slab_production_update():
+    d = request.json or {}
+    mid = int(num(d.get("id")))
+    p_date = str(d.get("date") or date.today().isoformat())
+    new_slab_id = int(num(d.get("slab_id")))
+    new_prod_id = int(num(d.get("product_id")))
+    new_in_kg = num(d.get("input_kg"))
+    pack_unit_kg = num(d.get("pack_unit_kg"))
+    new_packs = int(num(d.get("packs")))
+    new_out_kg = round(pack_unit_kg * new_packs, 3) if pack_unit_kg > 0 and new_packs > 0 else num(d.get("output_kg"))
+
+    conn = get_db()
+    m = conn.execute("SELECT * FROM movements WHERE id=? AND type='slab_production'", (mid,)).fetchone()
+    if not m:
+        conn.close()
+        return jsonify({"ok": False, "error": "수정할 생산 이력을 찾을 수 없습니다."})
+
+    old_slab = conn.execute("SELECT * FROM slabs WHERE id=?", (m["slab_id"],)).fetchone()
+    old_prod = conn.execute("SELECT * FROM products WHERE id=?", (m["product_id"],)).fetchone()
+    new_slab = conn.execute("SELECT * FROM slabs WHERE id=?", (new_slab_id,)).fetchone()
+    new_prod = conn.execute("SELECT * FROM products WHERE id=?", (new_prod_id,)).fetchone()
+    if not new_slab or not new_prod or new_in_kg <= 0:
+        conn.close()
+        return jsonify({"ok": False, "error": "슬랍, 생산 상품, 투입 KG를 정확히 입력하세요."})
+
+    old_in_kg = abs(m["slab_kg_delta"] or 0)
+    old_out_kg = abs(m["pack_kg_delta"] or m["kg_delta"] or 0)
+    old_packs = abs(m["pack_delta"] or m["qty"] or 0)
+
+    save_snapshot(conn, f"슬랍 생산이력 수정: #{mid}")
+
+    if old_slab:
+        r_rem = round(old_slab["remaining_kg"] + old_in_kg, 3)
+        conn.execute("UPDATE slabs SET remaining_kg=?, status='open' WHERE id=?", (r_rem, old_slab["id"]))
+        old_slab_pid = old_slab.get("product_id")
+        if not old_slab_pid:
+            match_op = resolve_slab_product(conn, None, old_slab["meat_type"], old_slab["cut"])
+            if match_op: old_slab_pid = match_op["id"]
+        if old_slab_pid:
+            conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg + ?, 3) WHERE id=?",
+                         (old_in_kg, old_slab_pid))
+    if old_prod:
+        conn.execute("UPDATE products SET pack_stock_kg = ROUND(pack_stock_kg - ?, 3), pack_count = pack_count - ? WHERE id=?",
+                     (old_out_kg, old_packs, old_prod["id"]))
+
+    fresh_slab = conn.execute("SELECT * FROM slabs WHERE id=?", (new_slab_id,)).fetchone()
+    n_rem = round(fresh_slab["remaining_kg"] - new_in_kg, 3)
+    n_status = "done" if n_rem <= 0.0001 else "open"
+    conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (n_rem, n_status, new_slab_id))
+    
+    new_slab_pid = fresh_slab.get("product_id")
+    if not new_slab_pid:
+        match_np = resolve_slab_product(conn, None, fresh_slab["meat_type"], fresh_slab["cut"])
+        if match_np: new_slab_pid = match_np["id"]
+    if new_slab_pid:
+        conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg - ?, 3) WHERE id=?",
+                     (new_in_kg, new_slab_pid))
+
+    conn.execute("UPDATE products SET pack_stock_kg = ROUND(pack_stock_kg + ?, 3), pack_count = pack_count + ? WHERE id=?",
+                 (new_out_kg, new_packs, new_prod_id))
+
+    conn.execute("""
+        UPDATE movements SET date=?, product_id=?, slab_id=?, meat_type=?, qty=?, kg_delta=?,
+        slab_kg_delta=?, pack_kg_delta=?, pack_delta=?, loss_kg=0, unit_price=?, amount=?, price_per_kg=?, note=?
+        WHERE id=?
+    """, (p_date, new_prod_id, new_slab_id, fresh_slab["meat_type"], new_packs, new_out_kg,
+          -new_in_kg, new_out_kg, new_packs,
+          fresh_slab["buy_price_kg"], round(new_out_kg * new_prod["sale_per_kg"], 2), new_prod["sale_per_kg"],
+          f"생산반영(수정) (슬랍 #{fresh_slab['slab_no'] or fresh_slab['id']} 투입 {new_in_kg}kg -> {new_packs}팩/{new_out_kg}kg)", mid))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/slabs/trim", methods=["POST"])
+def api_slab_trim():
+    d = request.json or {}
+    conn = get_db()
+    t_date = str(d.get("date") or date.today().isoformat())
+    slab_id = int(num(d.get("slab_id")))
+    product_id = int(num(d.get("product_id"))) if d.get("product_id") else None
+    trim_kg = num(d.get("trim_kg"))
+    note = str(d.get("note") or "").strip()
+
+    slab = conn.execute("SELECT * FROM slabs WHERE id=?", (slab_id,)).fetchone()
+    if not slab or trim_kg <= 0:
+        conn.close()
+        return jsonify({"ok": False, "error": "슬랍과 트림 KG를 입력하세요."})
+
+    if not product_id and slab["product_id"]:
+        product_id = slab["product_id"]
+
+    save_snapshot(conn, f"트림 등록: {slab['slab_no']} ({trim_kg}kg)")
+    rem = round(slab["remaining_kg"] - trim_kg, 3)
+    status = "done" if rem <= 0.0001 else "open"
+    conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (rem, status, slab_id))
+    
+    t_pid = slab.get("product_id")
+    if not t_pid:
+        mp = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
+        if mp: t_pid = mp["id"]
+    if t_pid:
+        conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg - ?, 3) WHERE id=?",
+                     (trim_kg, t_pid))
+
+    loss_amt = round(trim_kg * slab["buy_price_kg"], 2)
+    conn.execute("""
+        INSERT INTO movements (date, created_at, type, product_id, slab_id, meat_type, qty, kg_delta,
+        slab_kg_delta, loss_kg, trim_kg, unit_price, amount, price_per_kg, note)
+        VALUES (?, ?, 'trim', ?, ?, ?, 0, ?, ?, 0, ?, ?, ?, ?, ?)
+    """, (t_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), product_id, slab_id, slab["meat_type"],
+          -trim_kg, -trim_kg, trim_kg, slab["buy_price_kg"], loss_amt, slab["buy_price_kg"],
+          f"트림 등록 (슬랍 #{slab['slab_no'] or slab['cut']}) {note}".strip()))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/slabs/trim/update", methods=["POST"])
+def api_slab_trim_update():
+    d = request.json or {}
+    mid = int(num(d.get("id")))
+    t_date = str(d.get("date") or date.today().isoformat())
+    new_slab_id = int(num(d.get("slab_id")))
+    new_prod_id = int(num(d.get("product_id"))) if d.get("product_id") else None
+    new_trim_kg = num(d.get("trim_kg"))
+    note = str(d.get("note") or "").strip()
+
+    conn = get_db()
+    m = conn.execute("SELECT * FROM movements WHERE id=? AND type='trim'", (mid,)).fetchone()
+    if not m:
+        conn.close()
+        return jsonify({"ok": False, "error": "수정할 트림 이력을 찾을 수 없습니다."})
+
+    old_slab = conn.execute("SELECT * FROM slabs WHERE id=?", (m["slab_id"],)).fetchone()
+    new_slab = conn.execute("SELECT * FROM slabs WHERE id=?", (new_slab_id,)).fetchone()
+    if not new_slab or new_trim_kg <= 0:
+        conn.close()
+        return jsonify({"ok": False, "error": "슬랍과 트림 KG를 정확히 입력하세요."})
+
+    old_trim_kg = abs(m["slab_kg_delta"] or m["trim_kg"] or 0)
+    save_snapshot(conn, f"트림 이력 수정: #{mid}")
+
+    if old_slab:
+        r_rem = round(old_slab["remaining_kg"] + old_trim_kg, 3)
+        conn.execute("UPDATE slabs SET remaining_kg=?, status='open' WHERE id=?", (r_rem, old_slab["id"]))
+        old_spid = old_slab.get("product_id")
+        if not old_spid:
+            mp = resolve_slab_product(conn, None, old_slab["meat_type"], old_slab["cut"])
+            if mp: old_spid = mp["id"]
+        if old_spid:
+            conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg + ?, 3) WHERE id=?",
+                         (old_trim_kg, old_spid))
+
+    fresh_slab = conn.execute("SELECT * FROM slabs WHERE id=?", (new_slab_id,)).fetchone()
+    if not new_prod_id and fresh_slab["product_id"]:
+        new_prod_id = fresh_slab["product_id"]
+
+    n_rem = round(fresh_slab["remaining_kg"] - new_trim_kg, 3)
+    n_status = "done" if n_rem <= 0.0001 else "open"
+    conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (n_rem, n_status, new_slab_id))
+    
+    new_spid = fresh_slab.get("product_id")
+    if not new_spid:
+        mp = resolve_slab_product(conn, None, fresh_slab["meat_type"], fresh_slab["cut"])
+        if mp: new_spid = mp["id"]
+    if new_spid:
+        conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg - ?, 3) WHERE id=?",
+                     (new_trim_kg, new_spid))
+
+    loss_amt = round(new_trim_kg * fresh_slab["buy_price_kg"], 2)
+    clean_note = note if note.startswith("트림") else f"트림 등록(수정) (슬랍 #{fresh_slab['slab_no'] or fresh_slab['cut']}) {note}".strip()
+    conn.execute("""
+        UPDATE movements SET date=?, product_id=?, slab_id=?, meat_type=?, kg_delta=?,
+        slab_kg_delta=?, loss_kg=0, trim_kg=?, unit_price=?, amount=?, price_per_kg=?, note=?
+        WHERE id=?
+    """, (t_date, new_prod_id, new_slab_id, fresh_slab["meat_type"], -new_trim_kg, -new_trim_kg,
+          new_trim_kg, fresh_slab["buy_price_kg"], loss_amt, fresh_slab["buy_price_kg"],
+          clean_note, mid))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/waste", methods=["POST"])
+def api_waste():
+    d = request.json or {}
+    conn = get_db()
+    w_date = str(d.get("date") or date.today().isoformat())
+    meat_type = str(d.get("meat_type") or "돼지고기")
+    product_id = int(num(d.get("product_id")))
+    stock_source = str(d.get("stock_source") or "pack")
+    waste_kg = num(d.get("waste_kg"))
+    waste_packs = int(num(d.get("waste_packs")))
+    note = str(d.get("note") or "").strip()
+
+    prod = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not prod or waste_kg <= 0:
+        conn.close()
+        return jsonify({"ok": False, "error": "육종/상품과 폐기 KG를 입력하세요."})
+
+    save_snapshot(conn, f"폐기 등록: {prod['name']} ({waste_kg}kg)")
+    if stock_source == "slab":
+        new_slab = round(prod["slab_stock_kg"] - waste_kg, 3)
+        conn.execute("UPDATE products SET slab_stock_kg=? WHERE id=?", (new_slab, product_id))
+    else:
+        new_pack = round(prod["pack_stock_kg"] - waste_kg, 3)
+        new_cnt = prod["pack_count"] - waste_packs
+        conn.execute("UPDATE products SET pack_stock_kg=?, pack_count=? WHERE id=?", (new_pack, new_cnt, product_id))
+
+    loss_amt = round(waste_kg * prod["buy_price_kg"], 2)
+    conn.execute("""
+        INSERT INTO movements (date, created_at, type, product_id, meat_type, qty, kg_delta,
+        slab_kg_delta, pack_kg_delta, pack_delta, loss_kg, waste_kg, unit_price, amount, price_per_kg, note)
+        VALUES (?, ?, 'waste', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+    """, (w_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), product_id, meat_type,
+          -waste_packs, -waste_kg,
+          -waste_kg if stock_source == "slab" else 0.0,
+          -waste_kg if stock_source == "pack" else 0.0,
+          -waste_packs if stock_source == "pack" else 0,
+          waste_kg, prod["buy_price_kg"], loss_amt, prod["buy_price_kg"],
+          f"폐기 등록 [{'슬랍재고' if stock_source=='slab' else '팩재고'}] {note}".strip()))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/waste/update", methods=["POST"])
+def api_waste_update():
+    d = request.json or {}
+    mid = int(num(d.get("id")))
+    w_date = str(d.get("date") or date.today().isoformat())
+    meat_type = str(d.get("meat_type") or "돼지고기")
+    new_prod_id = int(num(d.get("product_id")))
+    stock_source = str(d.get("stock_source") or "pack")
+    waste_kg = num(d.get("waste_kg"))
+    waste_packs = int(num(d.get("waste_packs")))
+    note = str(d.get("note") or "").strip()
+
+    conn = get_db()
+    m = conn.execute("SELECT * FROM movements WHERE id=? AND type='waste'", (mid,)).fetchone()
+    if not m:
+        conn.close()
+        return jsonify({"ok": False, "error": "수정할 폐기 이력을 찾을 수 없습니다."})
+
+    new_prod = conn.execute("SELECT * FROM products WHERE id=?", (new_prod_id,)).fetchone()
+    if not new_prod or waste_kg <= 0:
+        conn.close()
+        return jsonify({"ok": False, "error": "육종/상품과 폐기 KG를 정확히 입력하세요."})
+
+    save_snapshot(conn, f"폐기 이력 수정: #{mid}")
+
+    old_pid = m["product_id"]
+    if old_pid:
+        old_prod = conn.execute("SELECT * FROM products WHERE id=?", (old_pid,)).fetchone()
+        if old_prod:
+            r_pack_kg = round(old_prod["pack_stock_kg"] + abs(m["pack_kg_delta"] or 0), 3)
+            r_slab_kg = round(old_prod["slab_stock_kg"] + abs(m["slab_kg_delta"] or 0), 3)
+            r_cnt = old_prod["pack_count"] + abs(m["pack_delta"] or 0)
+            conn.execute(
+                "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                (r_pack_kg, r_slab_kg, r_cnt, old_pid)
+            )
+
+    fresh_prod = conn.execute("SELECT * FROM products WHERE id=?", (new_prod_id,)).fetchone()
+    if stock_source == "slab":
+        u_slab = round(fresh_prod["slab_stock_kg"] - waste_kg, 3)
+        conn.execute("UPDATE products SET slab_stock_kg=? WHERE id=?", (u_slab, new_prod_id))
+    else:
+        u_pack = round(fresh_prod["pack_stock_kg"] - waste_kg, 3)
+        u_cnt = fresh_prod["pack_count"] - waste_packs
+        conn.execute("UPDATE products SET pack_stock_kg=?, pack_count=? WHERE id=?", (u_pack, u_cnt, new_prod_id))
+
+    loss_amt = round(waste_kg * fresh_prod["buy_price_kg"], 2)
+    clean_note = note if note.startswith("폐기") else f"폐기 등록(수정) [{'슬랍재고' if stock_source=='slab' else '팩재고'}] {note}".strip()
+    conn.execute("""
+        UPDATE movements SET date=?, product_id=?, meat_type=?, qty=?, kg_delta=?,
+        slab_kg_delta=?, pack_kg_delta=?, pack_delta=?, loss_kg=0, waste_kg=?,
+        unit_price=?, amount=?, price_per_kg=?, note=?
+        WHERE id=?
+    """, (w_date, new_prod_id, meat_type, -waste_packs, -waste_kg,
+          -waste_kg if stock_source == "slab" else 0.0,
+          -waste_kg if stock_source == "pack" else 0.0,
+          -waste_packs if stock_source == "pack" else 0,
+          waste_kg, fresh_prod["buy_price_kg"], loss_amt, fresh_prod["buy_price_kg"],
+          clean_note, mid))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/snapshots/delete", methods=["POST"])
+def api_snapshot_delete():
+    d = request.json or {}
+    snap_id = d.get("snapshot_id")
+    conn = get_db()
+    conn.execute("DELETE FROM snapshots WHERE id=?", (snap_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/movements/delete", methods=["POST"])
+def api_movement_delete():
+    d = request.json or {}
+    mid = d.get("id")
+    conn = get_db()
+    m = conn.execute("SELECT * FROM movements WHERE id=?", (mid,)).fetchone()
+    if not m:
+        conn.close()
+        return jsonify({"ok": False, "error": "해당 작업 내역을 찾을 수 없습니다."})
+
+    save_snapshot(conn, f"작업내역 삭제 및 원복: #{mid} ({m['type']})")
+    pid = m["product_id"]
+    sid = m["slab_id"]
+
+    if sid and m["type"] in ("slab_inbound", "slab_carryover"):
+        slab = conn.execute("SELECT * FROM slabs WHERE id=?", (sid,)).fetchone()
+        if slab:
+            t_pid = slab["product_id"]
+            if not t_pid:
+                mp = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
+                if mp: t_pid = mp["id"]
+            if t_pid and slab["remaining_kg"] != 0:
+                conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg - ?, 3) WHERE id=?",
+                             (slab["remaining_kg"], t_pid))
+            conn.execute("DELETE FROM slabs WHERE id=?", (sid,))
+
+    if sid and m["type"] in ("slab_production", "trim"):
+        slab = conn.execute("SELECT * FROM slabs WHERE id=?", (sid,)).fetchone()
+        if slab:
+            restore_kg = abs(m["slab_kg_delta"] or 0)
+            new_rem = round(slab["remaining_kg"] + restore_kg, 3)
+            conn.execute("UPDATE slabs SET remaining_kg=?, status='open' WHERE id=?", (new_rem, sid))
+            s_pid = slab.get("product_id")
+            if not s_pid:
+                mp = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
+                if mp: s_pid = mp["id"]
+            if s_pid:
+                conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg + ?, 3) WHERE id=?",
+                             (restore_kg, s_pid))
+
+    if pid and m["type"] in ("sale", "waste", "product_receiving", "carryover_inbound", "slab_production", "slab_carryover"):
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        if prod:
+            if m["type"] == "sale":
+                new_pack_kg = round(prod["pack_stock_kg"] - (m["pack_kg_delta"] or m["kg_delta"] or 0), 3)
+                new_slab_kg = round(prod["slab_stock_kg"] - (m["slab_kg_delta"] or 0), 3)
+                new_cnt = prod["pack_count"] + (m["qty"] or 0)
+                conn.execute("UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                             (new_pack_kg, new_slab_kg, new_cnt, pid))
+            elif m["type"] == "waste":
+                new_pack_kg = round(prod["pack_stock_kg"] + abs(m["pack_kg_delta"] or 0), 3)
+                new_slab_kg = round(prod["slab_stock_kg"] + abs(m["slab_kg_delta"] or 0), 3)
+                new_cnt = prod["pack_count"] + abs(m["pack_delta"] or 0)
+                conn.execute("UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                             (new_pack_kg, new_slab_kg, new_cnt, pid))
+            elif m["type"] == "slab_production":
+                new_pack_kg = round(prod["pack_stock_kg"] - abs(m["pack_kg_delta"] or m["kg_delta"] or 0), 3)
+                new_cnt = prod["pack_count"] - abs(m["pack_delta"] or m["qty"] or 0)
+                conn.execute("UPDATE products SET pack_stock_kg=?, pack_count=? WHERE id=?",
+                             (new_pack_kg, new_cnt, pid))
+            elif m["type"] in ("product_receiving", "carryover_inbound", "slab_carryover", "slab_inbound"):
+                new_pack_kg = round(prod["pack_stock_kg"] - abs(m["pack_kg_delta"] or 0), 3)
+                new_slab_kg = round(prod["slab_stock_kg"] - abs(m["slab_kg_delta"] or 0), 3)
+                new_cnt = prod["pack_count"] - abs(m["pack_delta"] or 0)
+                conn.execute("UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                             (new_pack_kg, new_slab_kg, new_cnt, pid))
+
+    conn.execute("DELETE FROM movements WHERE id=?", (mid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/sales/detail/<int:sid>", methods=["GET"])
+def api_sales_detail(sid):
+    conn = get_db()
+    si = conn.execute("SELECT * FROM sales_imports WHERE id=?", (sid,)).fetchone()
+    if not si:
+        conn.close()
+        return jsonify({"ok": False, "error": "판매 실행 내역을 찾을 수 없습니다."})
+    note_pattern = f"%[{si['sheet_name']}->{si['deduct_date']}]%"
+    rows = conn.execute("""
+        SELECT m.*, p.name AS product_name, p.sale_per_kg AS prod_sale_price
+        FROM movements m
+        LEFT JOIN products p ON m.product_id = p.id
+        WHERE m.type='sale' AND m.note LIKE ?
+        ORDER BY m.id ASC
+    """, (note_pattern,)).fetchall()
+    if not rows:
+        rows = conn.execute("""
+            SELECT m.*, p.name AS product_name, p.sale_per_kg AS prod_sale_price
+            FROM movements m
+            LEFT JOIN products p ON m.product_id = p.id
+            WHERE m.type='sale' AND m.date=?
+            ORDER BY m.id ASC
+        """, (si["deduct_date"],)).fetchall()
+    conn.close()
+    return jsonify({
+        "ok": True,
+        "import_info": dict(si),
+        "rows": [dict(r) for r in rows]
+    })
+
+@app.route("/api/products/history/<int:pid>", methods=["GET"])
+def api_product_history(pid):
+    conn = get_db()
+    prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not prod:
+        conn.close()
+        return jsonify({"ok": False, "error": "상품을 찾을 수 없습니다."})
+    
+    movs = conn.execute("""
+        SELECT m.*, s.slab_no AS slab_number, s.cut AS slab_cut
+        FROM movements m
+        LEFT JOIN slabs s ON m.slab_id = s.id
+        WHERE m.product_id = ?
+        ORDER BY m.date DESC, m.id DESC
+        LIMIT 100
+    """, (pid,)).fetchall()
+    conn.close()
+    return jsonify({
+        "ok": True,
+        "product": dict(prod),
+        "movements": [dict(m) for m in movs]
+    })
+
+def recalc_sales_import_summary(conn, si):
+    note_pattern = f"%[{si['sheet_name']}->{si['deduct_date']}]%"
+    rows = conn.execute("SELECT * FROM movements WHERE type='sale' AND note LIKE ?", (note_pattern,)).fetchall()
+    if not rows:
+        rows = conn.execute("SELECT * FROM movements WHERE type='sale' AND date=?", (si["deduct_date"],)).fetchall()
+    tot_qty = sum((r["qty"] or 0) for r in rows)
+    tot_kg = round(sum((-r["kg_delta"] or 0) for r in rows), 3)
+    tot_amt = round(sum(r["amount"] or 0 for r in rows), 2)
+    conn.execute(
+        "UPDATE sales_imports SET total_qty=?, total_kg=?, total_amount=? WHERE id=?",
+        (tot_qty, tot_kg, tot_amt, si["id"])
+    )
+
+@app.route("/api/sales/row/update", methods=["POST"])
+def api_sales_row_update():
+    d = request.json or {}
+    mid = int(num(d.get("movement_id")))
+    sales_id = int(num(d.get("sales_id")))
+    new_pid = int(num(d.get("product_id"))) if d.get("product_id") else None
+    new_qty = int(num(d.get("qty")))
+    new_kg = num(d.get("kg"))
+    new_amt = num(d.get("amount"))
+
+    conn = get_db()
+    m = conn.execute("SELECT * FROM movements WHERE id=?", (mid,)).fetchone()
+    si = conn.execute("SELECT * FROM sales_imports WHERE id=?", (sales_id,)).fetchone()
+    if not m or not si:
+        conn.close()
+        return jsonify({"ok": False, "error": "수정할 판매 항목을 찾을 수 없습니다."})
+
+    save_snapshot(conn, f"판매 실행 항목 수정: #{mid}")
+
+    old_pid = m["product_id"]
+    if old_pid:
+        old_prod = conn.execute("SELECT * FROM products WHERE id=?", (old_pid,)).fetchone()
+        if old_prod:
+            r_pack_kg = round(old_prod["pack_stock_kg"] - (m["pack_kg_delta"] or m["kg_delta"] or 0), 3)
+            r_slab_kg = round(old_prod["slab_stock_kg"] - (m["slab_kg_delta"] or 0), 3)
+            r_cnt = old_prod["pack_count"] + (m["qty"] or 0)
+            conn.execute(
+                "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                (r_pack_kg, r_slab_kg, r_cnt, old_pid)
+            )
+
+    pack_deduct_kg = 0.0
+    slab_deduct_kg = 0.0
+    meat_type = "미매칭"
+    ppk = round(new_amt / new_kg, 2) if new_kg != 0 else 0.0
+    note_str = f"판매엑셀(수정) [{si['sheet_name']}->{si['deduct_date']}] {new_qty}팩 / {new_kg}kg"
+
+    if new_pid:
+        new_prod = conn.execute("SELECT * FROM products WHERE id=?", (new_pid,)).fetchone()
+        if new_prod:
+            meat_type = new_prod["category"]
+            if ppk <= 0:
+                ppk = new_prod["sale_per_kg"]
+            if new_kg < 0:
+                pack_deduct_kg = new_kg
+                slab_deduct_kg = 0.0
+            else:
+                pack_deduct_kg = min(new_prod["pack_stock_kg"], new_kg)
+                rem_to_deduct = round(new_kg - pack_deduct_kg, 3)
+                slab_deduct_kg = min(new_prod["slab_stock_kg"], rem_to_deduct)
+
+            u_pack_kg = round(new_prod["pack_stock_kg"] - pack_deduct_kg, 3)
+            u_slab_kg = round(new_prod["slab_stock_kg"] - slab_deduct_kg, 3)
+            u_cnt = new_prod["pack_count"] - new_qty
+            conn.execute(
+                "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                (u_pack_kg, u_slab_kg, u_cnt, new_pid)
+            )
+            note_str = f"판매엑셀(수정) [{si['sheet_name']}->{si['deduct_date']}] {new_qty}팩 / 팩-{pack_deduct_kg}kg, 슬랍-{slab_deduct_kg}kg 반영"
+    else:
+        pack_deduct_kg = new_kg
+
+    conn.execute("""
+        UPDATE movements SET product_id=?, meat_type=?, qty=?, kg_delta=?,
+        slab_kg_delta=?, pack_kg_delta=?, pack_delta=?, unit_price=?, amount=?, price_per_kg=?, note=?
+        WHERE id=?
+    """, (new_pid, meat_type, new_qty, -new_kg,
+          -slab_deduct_kg, -pack_deduct_kg, -new_qty, ppk, new_amt, ppk, note_str, mid))
+
+    recalc_sales_import_summary(conn, si)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/sales/row/delete", methods=["POST"])
+def api_sales_row_delete():
+    d = request.json or {}
+    mid = int(num(d.get("movement_id")))
+    sales_id = int(num(d.get("sales_id")))
+    conn = get_db()
+    m = conn.execute("SELECT * FROM movements WHERE id=?", (mid,)).fetchone()
+    si = conn.execute("SELECT * FROM sales_imports WHERE id=?", (sales_id,)).fetchone()
+    if not m or not si:
+        conn.close()
+        return jsonify({"ok": False, "error": "삭제할 판매 항목을 찾을 수 없습니다."})
+
+    save_snapshot(conn, f"판매 실행 개별 항목 삭제: #{mid}")
+    pid = m["product_id"]
+    if pid:
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        if prod:
+            r_pack_kg = round(prod["pack_stock_kg"] - (m["pack_kg_delta"] or m["kg_delta"] or 0), 3)
+            r_slab_kg = round(prod["slab_stock_kg"] - (m["slab_kg_delta"] or 0), 3)
+            r_cnt = prod["pack_count"] + (m["qty"] or 0)
+            conn.execute(
+                "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                (r_pack_kg, r_slab_kg, r_cnt, pid)
+            )
+    conn.execute("DELETE FROM movements WHERE id=?", (mid,))
+    recalc_sales_import_summary(conn, si)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/sales/row/add", methods=["POST"])
+def api_sales_row_add():
+    d = request.json or {}
+    sales_id = int(num(d.get("sales_id")))
+    pid = int(num(d.get("product_id"))) if d.get("product_id") else None
+    qty = int(num(d.get("qty")))
+    kg = num(d.get("kg"))
+    amt = num(d.get("amount"))
+
+    conn = get_db()
+    si = conn.execute("SELECT * FROM sales_imports WHERE id=?", (sales_id,)).fetchone()
+    if not si or not pid:
+        conn.close()
+        return jsonify({"ok": False, "error": "상품과 수량/중량을 입력하세요."})
+
+    prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not prod:
+        conn.close()
+        return jsonify({"ok": False, "error": "상품을 찾을 수 없습니다."})
+
+    save_snapshot(conn, f"판매 실행 항목 추가: {prod['name']}")
+    if kg == 0 and amt != 0 and prod["sale_per_kg"] > 0:
+        kg = round(amt / prod["sale_per_kg"], 3)
+    if amt == 0 and kg != 0 and prod["sale_per_kg"] > 0:
+        amt = round(kg * prod["sale_per_kg"], 2)
+    ppk = round(amt / kg, 2) if kg != 0 else prod["sale_per_kg"]
+
+    if kg < 0:
+        pack_deduct_kg = kg
+        slab_deduct_kg = 0.0
+    else:
+        pack_deduct_kg = min(prod["pack_stock_kg"], kg)
+        rem_to_deduct = round(kg - pack_deduct_kg, 3)
+        slab_deduct_kg = min(prod["slab_stock_kg"], rem_to_deduct)
+
+    u_pack_kg = round(prod["pack_stock_kg"] - pack_deduct_kg, 3)
+    u_slab_kg = round(prod["slab_stock_kg"] - slab_deduct_kg, 3)
+    u_cnt = prod["pack_count"] - qty
+    conn.execute(
+        "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+        (u_pack_kg, u_slab_kg, u_cnt, pid)
+    )
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("""
+        INSERT INTO movements (date, created_at, type, product_id, meat_type, qty, kg_delta,
+        slab_kg_delta, pack_kg_delta, pack_delta, unit_price, amount, price_per_kg, note)
+        VALUES (?, ?, 'sale', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (si["deduct_date"], now_str, pid, prod["category"], qty, -kg,
+          -slab_deduct_kg, -pack_deduct_kg, -qty, ppk, amt, ppk,
+          f"판매엑셀(추가) [{si['sheet_name']}->{si['deduct_date']}] {qty}팩 / 팩-{pack_deduct_kg}kg, 슬랍-{slab_deduct_kg}kg 반영"))
+
+    recalc_sales_import_summary(conn, si)
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/sales/delete", methods=["POST"])
+def api_sales_delete():
+    d = request.json or {}
+    sid = d.get("id")
+    conn = get_db()
+    si = conn.execute("SELECT * FROM sales_imports WHERE id=?", (sid,)).fetchone()
+    if not si:
+        conn.close()
+        return jsonify({"ok": False, "error": "해당 판매 업로드 내역을 찾을 수 없습니다."})
+
+    save_snapshot(conn, f"판매 엑셀 실행 취소: {si['file_name']} [{si['sheet_name']}]")
+    note_pattern = f"%[{si['sheet_name']}->{si['deduct_date']}]%"
+    related_movs = conn.execute("SELECT * FROM movements WHERE type='sale' AND note LIKE ?", (note_pattern,)).fetchall()
+    if not related_movs:
+        related_movs = conn.execute("SELECT * FROM movements WHERE type='sale' AND date=?", (si["deduct_date"],)).fetchall()
+
+    for m in related_movs:
+        pid = m["product_id"]
+        if pid:
+            prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+            if prod:
+                new_pack_kg = round(prod["pack_stock_kg"] - (m["pack_kg_delta"] or m["kg_delta"] or 0), 3)
+                new_slab_kg = round(prod["slab_stock_kg"] - (m["slab_kg_delta"] or 0), 3)
+                new_cnt = prod["pack_count"] + (m["qty"] or 0)
+                conn.execute("UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+                             (new_pack_kg, new_slab_kg, new_cnt, pid))
+        conn.execute("DELETE FROM movements WHERE id=?", (m["id"],))
+
+    conn.execute("DELETE FROM sales_imports WHERE id=?", (sid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/sales/preview", methods=["POST"])
+@app.route("/api/sales_preview", methods=["POST"])
+def api_sales_preview():
+    f = request.files.get("file")
+    selected_date_str = request.form.get("selected_date", "").strip()
+    if not f:
+        return jsonify({"ok": False, "error": "엑셀 파일을 선택하세요."})
+
+    wb = openpyxl.load_workbook(f, data_only=True)
+    sheet_names = wb.sheetnames
+    target_sheet, sheet_dt = None, None
+
+    if selected_date_str:
+        try:
+            base_dt = datetime.strptime(selected_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            base_dt = date.today()
+    else:
+        base_dt = date.today()
+
+    target_dt = base_dt - timedelta(days=1)
+    target_mmdd = target_dt.strftime("%m%d")
+
+    for s in sheet_names:
+        clean_s = re.sub(r'[^0-9]', '', str(s))
+        if target_mmdd in clean_s:
+            target_sheet = s
+            sheet_dt = target_dt
+            break
+
+    if not target_sheet:
+        target_sheet = sheet_names[0]
+        sheet_dt = target_dt
+
+    deduct_dt = sheet_dt
+
+    ws = wb[target_sheet]
+    conn = get_db()
+    products = [dict(r) for r in conn.execute("SELECT * FROM products WHERE active=1").fetchall()]
+    already = conn.execute(
+        "SELECT * FROM sales_imports WHERE sheet_name=? AND deduct_date=?",
+        (target_sheet, deduct_dt.isoformat())
+    ).fetchone()
+    conn.close()
+
+    rows = []
+    for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        af = row[31] if len(row) > 31 else None
+        ag = row[32] if len(row) > 32 else None
+        ah = row[33] if len(row) > 33 else None
+
+        name = str(af or "").strip()
+        if not name and len(row) >= 3:
+            for c_val in row[:6]:
+                if isinstance(c_val, str) and len(c_val.strip()) > 1:
+                    name = c_val.strip()
+                    break
+        if not name:
+            continue
+
+        nk = normalize_key(name)
+        matched = next((p for p in products if p["name_key"] == nk), None)
+        if not matched:
+            matched = next((p for p in products if nk in p["name_key"] or p["name_key"] in nk), None)
+
+        qty = int(num(ag))
+        amount = num(ah)
+        sale_price = num(matched["sale_per_kg"]) if matched else 0.0
+        kg = round(amount / sale_price, 3) if sale_price > 0 and amount != 0 else 0.0
+        price_per_kg = round(amount / kg, 2) if kg != 0 else sale_price
+
+        if qty == 0 and amount == 0 and kg == 0:
+            continue
+
+        rows.append({
+            "row_no": idx,
+            "raw_name": name,
+            "product_id": matched["id"] if matched else None,
+            "product_name": matched["name"] if matched else "매칭 실패",
+            "qty": qty,
+            "kg": kg,
+            "amount": amount,
+            "price_per_kg": price_per_kg
+        })
+
+    return jsonify({
+        "ok": True,
+        "file_name": f.filename,
+        "sheet_names": sheet_names,
+        "target_sheet": target_sheet,
+        "sheet_date": sheet_dt.isoformat(),
+        "deduct_date": deduct_dt.isoformat(),
+        "deduct_mmdd": deduct_dt.strftime("%m%d"),
+        "already_imported": bool(already),
+        "rows": rows
+    })
+
+@app.route("/api/sales/apply", methods=["POST"])
+def api_sales_apply():
+    d = request.json or {}
+    file_name = str(d.get("file_name") or "sales.xlsx")
+    sheet_name = str(d.get("target_sheet") or "")
+    sheet_date = str(d.get("sheet_date") or date.today().isoformat())
+    deduct_date = str(d.get("deduct_date") or sheet_date)
+    rows = d.get("rows") or []
+
+    conn = get_db()
+    save_snapshot(conn, f"판매 엑셀 적용: {file_name} [{sheet_name}] -> 차감일 {deduct_date}")
+
+    total_qty, total_kg, total_amount = 0, 0.0, 0.0
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for r in rows:
+        pid = r.get("product_id")
+        kg = num(r.get("kg"))
+        qty = int(num(r.get("qty")))
+        amt = num(r.get("amount"))
+        ppk = num(r.get("price_per_kg"))
+        raw_name = str(r.get("raw_name") or "").strip()
+
+        if not pid:
+            if kg != 0 or qty != 0 or amt != 0:
+                conn.execute("""
+                    INSERT INTO movements (date, created_at, type, product_id, meat_type, qty, kg_delta,
+                    slab_kg_delta, pack_kg_delta, pack_delta, unit_price, amount, price_per_kg, note)
+                    VALUES (?, ?, 'sale', NULL, '미매칭', ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                """, (deduct_date, now_str, qty, -kg, -kg, -qty, ppk, amt, ppk,
+                      f"판매엑셀(미매칭: {raw_name}) [{sheet_name}->{deduct_date}] {qty}팩 / {kg}kg"))
+                total_qty += qty
+                total_kg = round(total_kg + kg, 3)
+                total_amount = round(total_amount + amt, 2)
+            continue
+
+        if kg == 0 and qty == 0 and amt == 0:
+            continue
+
+        prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        if not prod:
+            continue
+
+        if kg < 0:
+            pack_deduct_kg = kg
+            slab_deduct_kg = 0.0
+        else:
+            pack_deduct_kg = min(prod["pack_stock_kg"], kg)
+            rem_to_deduct = round(kg - pack_deduct_kg, 3)
+            slab_deduct_kg = min(prod["slab_stock_kg"], rem_to_deduct)
+
+        new_pack_kg = round(prod["pack_stock_kg"] - pack_deduct_kg, 3)
+        new_slab_kg = round(prod["slab_stock_kg"] - slab_deduct_kg, 3)
+        new_pack_cnt = prod["pack_count"] - qty
+
+        conn.execute(
+            "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
+            (new_pack_kg, new_slab_kg, new_pack_cnt, pid)
+        )
+
+        conn.execute("""
+            INSERT INTO movements (date, created_at, type, product_id, meat_type, qty, kg_delta,
+            slab_kg_delta, pack_kg_delta, pack_delta, unit_price, amount, price_per_kg, note)
+            VALUES (?, ?, 'sale', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (deduct_date, now_str, pid, prod["category"], qty, -kg,
+              -slab_deduct_kg, -pack_deduct_kg, -qty, ppk, amt, ppk,
+              f"판매엑셀 [{sheet_name}->{deduct_date}] {qty}팩 / 팩-{pack_deduct_kg}kg, 슬랍-{slab_deduct_kg}kg 반영"))
+
+        total_qty += qty
+        total_kg = round(total_kg + kg, 3)
+        total_amount = round(total_amount + amt, 2)
+
+    conn.execute("""
+        INSERT INTO sales_imports (file_name, sheet_name, sheet_date, deduct_date, imported_at, total_qty, total_kg, total_amount, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'done')
+    """, (file_name, sheet_name, sheet_date, deduct_date, now_str, total_qty, total_kg, total_amount))
+
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+def build_report_data(start_dt, end_dt, meat_filter="전체"):
+    conn = get_db()
+    settings = {r["k"]: r["v"] for r in conn.execute("SELECT * FROM settings").fetchall()}
+    fixed_loss_pct = num(settings.get("fixed_loss_rate", 20.0))
+
+    products = [dict(r) for r in conn.execute("SELECT * FROM products WHERE active=1 ORDER BY category, cut, name").fetchall()]
+    slabs = [dict(r) for r in conn.execute("SELECT * FROM slabs").fetchall()]
+    movs = [dict(r) for r in conn.execute(
+        "SELECT * FROM movements WHERE substr(date,1,10) BETWEEN ? AND ?", (start_dt, end_dt)
+    ).fetchall()]
+    conn.close()
+
+    slab_map = {s["id"]: s for s in slabs}
+    type_label_map = {
+        "product_receiving": "상품입고",
+        "carryover_inbound": "전월이월(상품)",
+        "slab_inbound": "슬랍입고",
+        "slab_carryover": "전월이월(슬랍)",
+        "slab_production": "생산반영",
+        "trim": "트림(정형손실)",
+        "waste": "폐기손실",
+        "sale": "판매차감"
+    }
+
+    report_rows = []
+    for p in products:
+        if meat_filter != "전체" and p["category"] != meat_filter:
+            continue
+        p_movs = [m for m in movs if m["product_id"] == p["id"]]
+        
+        buy_kg = sum(m["kg_delta"] for m in p_movs if m["type"] in ("product_receiving", "slab_inbound") and m["kg_delta"] > 0)
+        carryover_kg = sum(m["kg_delta"] for m in p_movs if m["type"] in ("carryover_inbound", "slab_carryover"))
+        buy_amt = sum(m["amount"] for m in p_movs if m["type"] in ("product_receiving", "slab_inbound"))
+
+        trim_kg = sum(m["trim_kg"] for m in p_movs if m["type"] == "trim")
+        waste_kg = sum(m["waste_kg"] for m in p_movs if m["type"] == "waste")
+        total_loss_kg = round(trim_kg + waste_kg, 3)
+
+        sale_qty = sum(m["qty"] for m in p_movs if m["type"] == "sale")
+        sale_kg = sum((-m["kg_delta"]) for m in p_movs if m["type"] == "sale")
+        sale_amt = sum(m["amount"] for m in p_movs if m["type"] == "sale")
+
+        expected_loss_kg = round(buy_kg * (fixed_loss_pct / 100.0), 3)
+        loss_base_kg = buy_kg if buy_kg > 0 else (sale_kg + total_loss_kg)
+        actual_loss_rate = round((total_loss_kg / loss_base_kg) * 100.0, 2) if loss_base_kg > 0 else 0.0
+        loss_amt = round(total_loss_kg * p["buy_price_kg"], 2)
+
+        cogs_amt = round(sale_kg * p["adjusted_price"], 2)
+        profit = round(sale_amt - cogs_amt - loss_amt, 2)
+        profit_rate = round((profit / sale_amt) * 100.0, 2) if sale_amt > 0 else 0.0
+        net_margin_vs_loss = round(profit_rate - actual_loss_rate, 2)
+        tot_stock = round(p["slab_stock_kg"] + p["pack_stock_kg"], 3)
+
+        detail_logs = []
+        for m in sorted(p_movs, key=lambda x: (x["date"], x["id"]), reverse=True):
+            s_info = slab_map.get(m["slab_id"])
+            origin = f"슬랍 #{s_info['slab_no'] or s_info['id']} ({s_info['cut']})" if s_info else (
+                "팩재고" if abs(m["pack_kg_delta"] or 0) > 0 else ("슬랍재고" if abs(m["slab_kg_delta"] or 0) > 0 else "직접입력")
+            )
+            detail_logs.append({
+                "id": m["id"],
+                "date": m["date"],
+                "type": m["type"],
+                "type_label": type_label_map.get(m["type"], m["type"]),
+                "origin": origin,
+                "qty": m["qty"],
+                "kg_delta": round(m["kg_delta"] or 0, 3),
+                "slab_kg_delta": round(m["slab_kg_delta"] or 0, 3),
+                "pack_kg_delta": round(m["pack_kg_delta"] or 0, 3),
+                "trim_kg": round(m["trim_kg"] or 0, 3),
+                "waste_kg": round(m["waste_kg"] or 0, 3),
+                "total_loss_kg": round(m["trim_kg"] or 0, 3) + round(m["waste_kg"] or 0, 3),
+                "amount": round(m["amount"] or 0, 2),
+                "note": m["note"] or ""
+            })
+
+        report_rows.append({
+            "id": p["id"],
+            "category": p["category"],
+            "cut": p["cut"],
+            "name": p["name"],
+            "last_buy_price": p["buy_price_kg"],
+            "adjusted_price": p["adjusted_price"],
+            "sale_per_kg": p["sale_per_kg"],
+            "carryover_kg": round(carryover_kg, 3),
+            "buy_kg": round(buy_kg, 3),
+            "buy_amt": round(buy_amt, 2),
+            "slab_stock_kg": round(p["slab_stock_kg"], 3),
+            "pack_stock_kg": round(p["pack_stock_kg"], 3),
+            "pack_count": p["pack_count"],
+            "total_stock_kg": tot_stock,
+            "min_stock_kg": 7.0,
+            "stock_value": round(tot_stock * p["sale_per_kg"], 2),
+            "expected_loss_kg": expected_loss_kg,
+            "trim_kg": round(trim_kg, 3),
+            "waste_kg": round(waste_kg, 3),
+            "total_loss_kg": total_loss_kg,
+            "actual_loss_rate": actual_loss_rate,
+            "loss_amt": loss_amt,
+            "sale_qty": sale_qty,
+            "sale_kg": round(sale_kg, 3),
+            "sale_amt": round(sale_amt, 2),
+            "profit": profit,
+            "profit_rate": profit_rate,
+            "net_margin_vs_loss": net_margin_vs_loss,
+            "detail_logs": detail_logs
+        })
+    return fixed_loss_pct, report_rows
+
+@app.route("/api/report", methods=["GET"])
+def api_report():
+    start_dt = request.args.get("start") or date.today().replace(day=1).isoformat()
+    end_dt = request.args.get("end") or date.today().isoformat()
+    meat_filter = request.args.get("meat") or "전체"
+    fixed_loss_pct, report_rows = build_report_data(start_dt, end_dt, meat_filter)
+    return jsonify({"ok": True, "fixed_loss_pct": fixed_loss_pct, "rows": report_rows})
+
+@app.route("/api/backup/export", methods=["GET"])
+def api_backup_export():
+    conn = get_db()
+    payload = {
+        "products": [dict(r) for r in conn.execute("SELECT * FROM products").fetchall()],
+        "slabs": [dict(r) for r in conn.execute("SELECT * FROM slabs").fetchall()],
+        "movements": [dict(r) for r in conn.execute("SELECT * FROM movements").fetchall()],
+        "sales_imports": [dict(r) for r in conn.execute("SELECT * FROM sales_imports").fetchall()],
+        "settings": [dict(r) for r in conn.execute("SELECT * FROM settings").fetchall()]
+    }
+    conn.close()
+    bio = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8'))
+    bio.seek(0)
+    filename = f"DreamMart_Backup_{date.today().isoformat()}.json"
+    return send_file(bio, as_attachment=True, download_name=filename, mimetype="application/json")
+
+@app.route("/api/backup/import", methods=["POST"])
+def api_backup_import():
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "백업 JSON 파일을 선택하세요."})
+    try:
+        data = json.loads(f.read().decode('utf-8'))
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"JSON 파일 파싱 실패: {str(e)}"})
+
+    conn = get_db()
+    save_snapshot(conn, "JSON 백업 데이터 복원(Import)")
+    for tbl in ["products", "slabs", "movements", "sales_imports", "settings"]:
+        if tbl in data:
+            conn.execute(f"DELETE FROM {tbl}")
+            for r in data[tbl]:
+                cols = list(r.keys())
+                conn.execute(f"INSERT INTO {tbl} ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", [r[c] for c in cols])
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/export/excel", methods=["GET"])
+def api_export_excel():
+    start_dt = request.args.get("start") or date.today().replace(day=1).isoformat()
+    end_dt = request.args.get("end") or date.today().isoformat()
+    meat_filter = request.args.get("meat") or "전체"
+
+    fixed_loss_pct, report_rows = build_report_data(start_dt, end_dt, meat_filter)
+
+    conn = get_db()
+    slabs = [dict(r) for r in conn.execute("SELECT * FROM slabs ORDER BY date DESC, id DESC").fetchall()]
+    movs = [dict(r) for r in conn.execute(
+        "SELECT m.*, p.name AS prod_name FROM movements m LEFT JOIN products p ON m.product_id=p.id WHERE substr(m.date,1,10) BETWEEN ? AND ? ORDER BY m.date DESC, m.id DESC",
+        (start_dt, end_dt)
+    ).fetchall()]
+    sales_imports = [dict(r) for r in conn.execute("SELECT * FROM sales_imports ORDER BY id DESC").fetchall()]
+    conn.close()
+
+    wb = openpyxl.Workbook()
+    header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    sub_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+    warn_fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True, size=10)
+    bold_font = Font(bold=True, size=10)
+    thin = Side(border_style="thin", color="CBD5E1")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def style_sheet(ws, headers, col_widths):
+        ws.append(headers)
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+            ws.column_dimensions[get_column_letter(col_idx)].width = col_widths[col_idx - 1]
+        ws.freeze_panes = "A2"
+
+    ws1 = wb.active
+    ws1.title = "1_재고_손익통합보고서"
+    h1 = [
+        "파트", "부위", "상품명", "매입가(₱/kg)", "보정단가(₱/kg)", "판매가(₱/kg)",
+        "슬랍재고(KG)", "팩재고(KG)", "팩수량", "총재고(KG)", "안전재고(KG)", "재고상태", "재고평가액(₱)",
+        "전월이월(KG)", "당기순구매(KG)", "기간판매(팩)", "기간판매(KG)", "기간판매액(₱)",
+        f"예상로스({fixed_loss_pct}%)", "트림(KG)", "폐기(KG)", "실로스(KG)", "실로스율(%)", "로스손실액(₱)", "추정순익(₱)", "수익률(%)", "수익률-실로스율(%p)"
+    ]
+    w1 = [10, 10, 28, 13, 13, 13, 13, 13, 10, 13, 12, 12, 15, 13, 13, 12, 13, 15, 14, 11, 11, 12, 12, 14, 14, 11, 16]
+    style_sheet(ws1, h1, w1)
+
+    for r in report_rows:
+        st_txt = "부족(발주필요)" if r["total_stock_kg"] <= 7.0 else "정상"
+        row_vals = [
+            r["category"], r["cut"], r["name"], r["last_buy_price"], r["adjusted_price"], r["sale_per_kg"],
+            r["slab_stock_kg"], r["pack_stock_kg"], r["pack_count"], r["total_stock_kg"], 7.0, st_txt, r["stock_value"],
+            r["carryover_kg"], r["buy_kg"], r["sale_qty"], r["sale_kg"], r["sale_amt"],
+            r["expected_loss_kg"], r["trim_kg"], r["waste_kg"], r["total_loss_kg"], r["actual_loss_rate"], r["loss_amt"], r["profit"], r["profit_rate"], r["net_margin_vs_loss"]
+        ]
+        ws1.append(row_vals)
+        cur_r = ws1.max_row
+        for c_i in range(1, len(h1) + 1):
+            cell = ws1.cell(row=cur_r, column=c_i)
+            cell.border = border
+            if st_txt != "정상" and c_i in (10, 12):
+                cell.fill = warn_fill
+                cell.font = bold_font
+            if r["net_margin_vs_loss"] < 0 and c_i == 27:
+                cell.fill = warn_fill
+                cell.font = bold_font
+
+    if report_rows:
+        tot_r = ws1.max_row + 1
+        ws1.cell(row=tot_r, column=1, value="합계").font = bold_font
+        sum_cols = [7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25]
+        for c_i in range(1, len(h1) + 1):
+            c = ws1.cell(row=tot_r, column=c_i)
+            c.fill = sub_fill
+            c.border = border
+            if c_i in sum_cols:
+                col_let = get_column_letter(c_i)
+                c.value = f"=SUM({col_let}2:{col_let}{tot_r-1})"
+                c.font = bold_font
+
+    ws2 = wb.create_sheet("2_슬랍원물현황")
+    h2 = ["슬랍ID", "입고일", "구분", "육종", "부위", "슬랍번호", "최초중량(KG)", "잔여중량(KG)", "매입가(100g)", "매입가(KG)", "상태"]
+    w2 = [10, 13, 12, 11, 12, 16, 14, 14, 13, 13, 12]
+    style_sheet(ws2, h2, w2)
+    for s in slabs:
+        ws2.append([
+            s["id"], s["date"], "전월이월" if s.get("is_carryover") else "당월입고",
+            s["meat_type"], s["cut"], s["slab_no"],
+            s["kg"], s["remaining_kg"], s["buy_price_100g"], s["buy_price_kg"],
+            "소진" if s["remaining_kg"] <= 0.0001 else "보유중"
+        ])
+        for c_i in range(1, len(h2) + 1):
+            ws2.cell(row=ws2.max_row, column=c_i).border = border
+
+    ws3 = wb.create_sheet("3_기간별입출고상세")
+    h3 = ["기준일자", "등록시각", "구분", "육종", "상품명", "수량(팩)", "중량변동(KG)", "트림(KG)", "폐기(KG)", "금액(₱)", "KG당단가(₱)", "메모"]
+    w3 = [13, 20, 16, 10, 26, 10, 14, 11, 11, 14, 13, 38]
+    style_sheet(ws3, h3, w3)
+    type_map = {
+        "product_receiving": "상품입고", "carryover_inbound": "전월이월(상품)",
+        "slab_inbound": "슬랍입고", "slab_carryover": "전월이월(슬랍)",
+        "slab_production": "생산반영", "trim": "트림", "waste": "폐기", "sale": "판매차감"
+    }
+    for m in movs:
+        ws3.append([
+            m["date"], m["created_at"], type_map.get(m["type"], m["type"]), m["meat_type"],
+            m["prod_name"] or "-", m["qty"], m["kg_delta"], m["trim_kg"], m["waste_kg"],
+            m["amount"], m["price_per_kg"], m["note"]
+        ])
+        for c_i in range(1, len(h3) + 1):
+            ws3.cell(row=ws3.max_row, column=c_i).border = border
+
+    ws4 = wb.create_sheet("4_판매엑셀반영이력")
+    h4 = ["반영일시", "파일명", "인식시트명", "시트기준일", "실제차감일", "총판매(팩)", "총판매(KG)", "총판매액(₱)", "상태"]
+    w4 = [20, 24, 14, 13, 13, 12, 13, 15, 10]
+    style_sheet(ws4, h4, w4)
+    for si in sales_imports:
+        ws4.append([
+            si["imported_at"], si["file_name"], si["sheet_name"], si["sheet_date"], si["deduct_date"],
+            si["total_qty"], si["total_kg"], si["total_amount"], "완료"
+        ])
+        for c_i in range(1, len(h4) + 1):
+            ws4.cell(row=ws4.max_row, column=c_i).border = border
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    filename = f"DreamMart_정육재고보고서_{start_dt}_{end_dt}.xlsx"
+    return send_file(
+        bio,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>드림마트 정육·재고 통합관리 v5.1.4</title>
+<style>
+  :root {
+    --bg: #f4f6f9; --card: #ffffff; --primary: #1e3a8a; --accent: #2563eb;
+    --border: #dce1e8; --text: #1f2937; --muted: #6b7280;
+    --danger-bg: #fee2e2; --danger-text: #991b1b;
+    --other-date-bg: #f8fafc; --done-bg: #dcfce7;
+  }
+  * { box-sizing: border-box; font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; }
+  body { margin: 0; background: var(--bg); color: var(--text); display: flex; min-height: 100vh; }
+  aside { width: 235px; background: #0f172a; color: #fff; padding: 20px 14px; display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+  aside h1 { font-size: 18px; margin: 0 0 14px 6px; line-height: 1.35; }
+  aside button.nav { background: transparent; border: none; color: #cbd5e1; text-align: left; padding: 11px 14px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  aside button.nav.active, aside button.nav:hover { background: #1e40af; color: #fff; }
+  .net-box { margin-top: auto; background: #1e293b; padding: 10px; border-radius: 8px; font-size: 11px; color: #94a3b8; line-height: 1.45; }
+  main { flex: 1; padding: 22px; overflow-x: auto; }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; flex-wrap: wrap; gap: 10px; }
+  .btn { padding: 8px 14px; border-radius: 6px; border: 1px solid var(--border); background: #fff; cursor: pointer; font-weight: 600; font-size: 13px; }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn.excel { background: #15803d; color: #fff; border-color: #15803d; }
+  .btn.warn { background: #dc2626; color: #fff; border-color: #dc2626; }
+  .btn.undo { background: #f59e0b; color: #fff; border-color: #f59e0b; }
+  .grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 16px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: 0.2s; }
+  .card:hover { border-color: var(--accent); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+  .card small { color: var(--muted); display: block; margin-bottom: 4px; font-size: 12px; }
+  .card strong { font-size: 19px; color: var(--primary); }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 12px 0; font-size: 16px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .form-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  input, select { padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { border-bottom: 1px solid var(--border); padding: 8px 6px; text-align: left; }
+  th { background: #f1f5f9; font-weight: 700; color: #334155; }
+  tr.zero-kg { background-color: var(--danger-bg) !important; color: var(--danger-text); }
+  tr.low-stock { background-color: #fef3c7 !important; }
+  tr.carryover-row { background-color: #eff6ff !important; }
+  tr.other-date { background-color: var(--other-date-bg); color: #64748b; }
+  tr.done-row { background-color: #dcfce7; }
+  tr.selected-row { background-color: #dbeafe !important; outline: 2px solid #2563eb; }
+  .badge { padding: 2px 7px; border-radius: 99px; font-size: 11px; font-weight: 700; }
+  .badge.ok { background: #dcfce7; color: #166534; }
+  .badge.low { background: #fee2e2; color: #991b1b; }
+  .badge.carry { background: #dbeafe; color: #1e40af; }
+  .subtabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .subtabs button { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--border); background: #fff; cursor: pointer; font-weight: 600; }
+  .subtabs button.active { background: #0f172a; color: #fff; }
+  .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; max-width: 440px; margin-bottom: 10px; }
+  .cal-cell { border: 1px solid var(--border); padding: 6px; text-align: center; border-radius: 6px; cursor: pointer; font-size: 12px; background: #fff; }
+  .cal-cell.has-in { border-color: #dc2626; background: #fee2e2; font-weight: bold; color: #991b1b; }
+  .cal-cell.has-sale { border-color: #16a34a; background: #dcfce7; font-weight: bold; color: #166534; }
+  .cal-cell.has-warn { border-color: #d97706; background: #fef3c7; font-weight: bold; color: #92400e; }
+  .cal-cell.selected { background: #2563eb !important; color: #fff !important; border-color: #1d4ed8 !important; }
+  .toast { position: fixed; top: 16px; right: 20px; background: #0f172a; color: #fff; padding: 10px 16px; border-radius: 8px; z-index: 999; font-size: 13px; }
+  .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: flex; justify-content: center; align-items: center; z-index: 1000; }
+  .modal-box { background: #fff; width: 920px; max-width: 95vw; max-height: 90vh; border-radius: 12px; padding: 20px; overflow-y: auto; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
+  .clickable-product { color: #2563eb; cursor: pointer; text-decoration: underline; font-weight: bold; }
+  .clickable-product:hover { color: #1e40af; }
+  .clickable-row { cursor: pointer; }
+  .clickable-row:hover { background-color: #eff6ff !important; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>드림마트<br>정육·재고 관리 v5.1.4</h1>
+  <button class="nav active" onclick="showTab('dashboard', this)">1. 오늘·이번달 현황</button>
+  <button class="nav" onclick="showTab('products', this)">2. 상품·재고 관리 & 입고달력</button>
+  <button class="nav" onclick="showTab('slabs', this)">3. 슬랍 원물·생산·트림·폐기</button>
+  <button class="nav" onclick="showTab('sales', this)">4. 판매 엑셀 등록·관리</button>
+  <button class="nav" onclick="showTab('report', this)">5. 기간별 보고서</button>
+  <button class="nav" onclick="showTab('history', this)">6. 전체 작업 이력·복구·백업</button>
+  <div class="net-box">
+    <b>네트워크 공유 실행 안내</b><br>
+    이 폴더를 NAS/공유드라이브에 두면 동일 데이터 공유 실행됩니다.<br><br>
+    LAN 내 다른 기기 접속:<br>
+    <code>http://[이PC의IP]:5050</code>
+  </div>
+</aside>
+
+<main>
+  <header>
+    <div>
+      <strong style="font-size:20px;" id="page-title">1. 오늘·이번달 현황</strong>
+      <div style="font-size:12px;color:#64748b;" id="db-info"></div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn excel" onclick="exportExcel('month')">📥 이번달 통합 엑셀 다운로드</button>
+      <button class="btn undo" onclick="undoLast()">↩ 직전 실행 취소(Undo)</button>
+      <button class="btn primary" onclick="forceRefreshAll()">🔄 전체 새로고침 (최신 반영)</button>
+    </div>
+  </header>
+
+  <div id="toast" class="toast" style="display:none;"></div>
+
+  <!-- 품명 클릭 상세 모달 팝업 -->
+  <div id="product-modal" class="modal-overlay" style="display:none;" onclick="closeProductModal()">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:8px;">
+        <h2 id="modal-product-title" style="margin:0; font-size:18px; color:var(--primary);">상품 상세 이력</h2>
+        <button class="btn" onclick="closeProductModal()">닫기 ✕</button>
+      </div>
+      <div id="modal-product-summary" style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:16px;"></div>
+      <h3 style="font-size:14px; margin-bottom:8px;">📋 해당 품목의 전체 입출고·판매 내역 ( 행을 클릭하면 곧바로 수정/관리 화면으로 이동합니다 )</h3>
+      <div style="max-height:400px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr><th>기준일자</th><th>구분</th><th>수량(팩)</th><th>중량변동(KG)</th><th>단가(₱)</th><th>금액(₱)</th><th>상세 메모</th></tr>
+          </thead>
+          <tbody id="modal-product-history-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 슬랍 요약 카드 클릭 시 상세 이력 팝업 -->
+  <div id="slab-summary-modal" class="modal-overlay" style="display:none;" onclick="closeSlabSummaryModal()">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:8px;">
+        <h2 id="slab-summary-modal-title" style="margin:0; font-size:18px; color:var(--primary);">슬랍 요약 상세 현황</h2>
+        <button class="btn" onclick="closeSlabSummaryModal()">닫기 ✕</button>
+      </div>
+      <div style="max-height:450px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr><th>입고일</th><th>육종</th><th>부위</th><th>슬랍번호</th><th>최초KG</th><th>잔여KG</th><th>매입단가(₱/kg)</th><th>상태</th></tr>
+          </thead>
+          <tbody id="slab-summary-modal-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 대시보드 요약 내역 상세 팝업 -->
+  <div id="summary-detail-modal" class="modal-overlay" style="display:none;" onclick="closeSummaryModal()">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:8px;">
+        <h2 id="summary-modal-title" style="margin:0; font-size:18px; color:var(--primary);">항목별 상세 내역 이력</h2>
+        <button class="btn" onclick="closeSummaryModal()">닫기 ✕</button>
+      </div>
+      <div style="max-height:450px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr><th>기준일자</th><th>구분</th><th>상품/슬랍명</th><th>수량(팩)</th><th>변동중량(KG)</th><th>금액(₱)</th><th>상세 메모</th><th>바로가기/수정</th></tr>
+          </thead>
+          <tbody id="summary-modal-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 1. 대시보드 -->
+  <section id="tab-dashboard">
+    <div class="panel">
+      <h2>
+        <span>기준일 판매·입출고 현황 (<input type="date" id="dash-target-date" onchange="renderDashboard()">)</span>
+        <span style="font-size:12px;color:#64748b;font-weight:normal;">* 카드를 클릭하면 해당 항목의 상세 내역을 확인하고 바로 수정할 수 있습니다.</span>
+      </h2>
+      <div class="grid-5" id="today-cards"></div>
+    </div>
+    <div class="panel">
+      <h2>
+        <span>선택 월 누적 현황 (<span id="month-label"></span>)</span>
+        <span id="low-stock-alert" style="font-size:12.5px;color:#dc2626;"></span>
+      </h2>
+      <div class="grid-5" id="month-cards"></div>
+    </div>
+    <div class="panel">
+      <h2>
+        <span>품목별 실시간 재고 & 이번 달 판매 요약 (💡 품명을 클릭하면 상세 판매·입출고 이력을 확인할 수 있습니다)</span>
+        <div class="form-row" style="margin:0;">
+          <input id="dash-search" placeholder="상품명 검색..." oninput="renderDashboard()" style="width:180px;">
+          <select id="dash-part-filter" onchange="renderDashboard()">
+            <option value="전체">전체 파트</option>
+            <option value="돼지고기">돼지고기</option>
+            <option value="소고기">소고기</option>
+            <option value="닭고기">닭고기</option>
+          </select>
+          <label style="font-size:12px;"><input type="checkbox" id="dash-low-only" onchange="renderDashboard()"> 안전재고 부족만 보기</label>
+        </div>
+      </h2>
+      <table>
+        <thead>
+          <tr>
+            <th>파트</th><th>부위</th><th>상품명 (클릭하여 이력조회)</th><th>슬랍재고(KG)</th><th>팩재고(KG)</th><th>팩개수</th>
+            <th>총재고(KG)</th><th>안전재고(7kg)</th><th>이번달 판매(팩/KG)</th><th>판매가/kg</th><th>재고금액(₱)</th>
+          </tr>
+        </thead>
+        <tbody id="dash-stock-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 2. 상품·재고 관리 & 입고달력 (육종별 탭 분리 적용) -->
+  <section id="tab-products" style="display:none;">
+    <div class="panel">
+      <h2>상품 입고 / 전월 이월 재고 등록·수정 & 입고 달력 히스토리</h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;">
+        <div>
+          <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
+            <input type="month" id="rec-cal-month" onchange="renderReceivingCalendar()">
+            <button class="btn" onclick="selectedRecCalDate='';renderReceivingCalendar();renderReceivingTable();">전체 목록 보기</button>
+          </div>
+          <div class="cal-grid" id="receiving-calendar"></div>
+          <div style="font-size:11px;color:#dc2626;margin-top:4px;">* 상품 입고/이월 기록이 있는 날짜는 빨간색으로 표시됩니다.</div>
+        </div>
+        <div style="flex:1;min-width:320px;">
+          <input type="hidden" id="edit-rec-id">
+          <div class="form-row">
+            <input type="date" id="rec-date">
+            <select id="rec-meat" onchange="updateReceiveProductOptions()" style="width:110px;">
+              <option value="돼지고기">돼지고기</option>
+              <option value="소고기">소고기</option>
+              <option value="닭고기">닭고기</option>
+            </select>
+            <select id="rec-prod" style="min-width:200px;"></select>
+            <select id="rec-target"><option value="pack">팩 재고로 반영</option><option value="slab">슬랍 재고로 반영</option></select>
+          </div>
+          <div class="form-row">
+            <input type="number" step="0.01" id="rec-buy100" placeholder="매입단가 (100g당 ₱)">
+            <input type="number" step="0.001" id="rec-kg" placeholder="총 중량 KG">
+            <input type="number" id="rec-packs" placeholder="팩 개수 (선택)">
+          </div>
+          <div class="form-row">
+            <label style="font-size:12.5px;color:#1e40af;font-weight:bold;">
+              <input type="checkbox" id="rec-carryover"> 전월 이월 재고 (구매KG 제외 및 재고 정상적용)
+            </label>
+            <button class="btn primary" id="btn-rec-submit" onclick="submitProductReceive()">입고 등록 실행</button>
+            <button class="btn" id="btn-rec-cancel" style="display:none;" onclick="resetReceiveForm()">수정 취소</button>
+          </div>
+        </div>
+      </div>
+      <h3 style="margin-top:14px;font-size:14px;">상품 입고 및 전월이월 이력 목록 (입고 KG, 순반영 KG, 단가, 총 구매금액 포함)</h3>
+      <table>
+        <thead>
+          <tr><th>기준일</th><th>구분</th><th>반영대상</th><th>상품명</th><th>수량(팩)</th><th>입고 KG</th><th>순반영 KG</th><th>단가(₱/kg)</th><th>총 구매금액(₱)</th><th>메모</th><th>관리</th></tr>
+        </thead>
+        <tbody id="receiving-table-body"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>카탈로그 등록 및 전체 수정 (안전재고는 일괄 7kg로 자동 적용됩니다)</h2>
+      <div class="form-row">
+        <input type="hidden" id="edit-prod-id">
+        <select id="prod-cat" onchange="updateCatalogCuts()"><option>돼지고기</option><option>소고기</option><option>닭고기</option></select>
+        <select id="prod-cut" onchange="updateCatalogNames()"></select>
+        <select id="prod-preset" onchange="document.getElementById('prod-name').value=this.value"><option value="">카탈로그 선택</option></select>
+        <input id="prod-name" placeholder="상품명 직접입력/수정" style="min-width:220px;">
+        <input id="prod-barcode" placeholder="바코드">
+      </div>
+      <div class="form-row">
+        <input type="number" step="0.01" id="prod-buy100" placeholder="매입단가(100g당 ₱)" oninput="previewCalcPrice()">
+        <input type="number" step="0.01" id="prod-adj" placeholder="보정단가(₱/kg)">
+        <input type="number" step="0.01" id="prod-sale" placeholder="판매가(₱/kg)">
+        <input type="number" step="0.001" id="prod-slab-kg" placeholder="슬랍 재고 KG">
+        <input type="number" step="0.001" id="prod-pack-kg" placeholder="팩 재고 KG">
+        <input type="number" id="prod-pack-cnt" placeholder="팩 개수">
+        <input type="hidden" id="prod-min-kg" value="7">
+        <button class="btn primary" onclick="saveProduct()">저장 / 수정반영</button>
+        <button class="btn" onclick="resetProdForm()">초기화</button>
+      </div>
+      <div id="price-preview" style="font-size:12px;color:#2563eb;margin-top:4px;"></div>
+    </div>
+
+    <div class="panel">
+      <h2>전체 상품·재고 목록 및 육종별 보기 (입고 히스토리 확인 가능)</h2>
+      <div class="subtabs">
+        <button class="active" onclick="filterProdPart('전체', this)">전체</button>
+        <button onclick="filterProdPart('돼지고기', this)">돼지고기 (삼겹살·목살순)</button>
+        <button onclick="filterProdPart('소고기', this)">소고기</button>
+        <button onclick="filterProdPart('닭고기', this)">닭고기</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>파트</th><th>부위</th><th>상품명 (클릭하여 입고 히스토리 조회)</th><th>매입가(100g/kg)</th><th>보정단가</th><th>판매가</th><th>슬랍KG</th><th>팩KG</th><th>팩수</th><th>총재고KG</th><th>안전재고(7kg)</th><th>재고금액(₱)</th><th>수정</th></tr>
+        </thead>
+        <tbody id="prod-table-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 3. 슬랍 원물·생산·트림·폐기 -->
+  <section id="tab-slabs" style="display:none;">
+    <div class="grid-4" id="slab-summary-cards"></div>
+
+    <div class="subtabs">
+      <button class="active" onclick="showSlabSubTab('inbound', this)">① 슬랍 입고·전월이월 관리</button>
+      <button onclick="showSlabSubTab('production', this)">② 생산 관리</button>
+      <button onclick="showSlabSubTab('trim', this)">③ 트림 관리</button>
+      <button onclick="showSlabSubTab('waste', this)">④ 폐기 관리</button>
+    </div>
+
+    <!-- ① 슬랍 입고 및 전월 이월 -->
+    <div id="slab-subtab-inbound" class="panel">
+      <h2>① 슬랍 입고 & 전월(이전달) 이월 재고 등록·수정·삭제</h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;">
+        <div>
+          <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
+            <input type="month" id="cal-month" onchange="renderCalendar()">
+            <button class="btn" onclick="selectedCalDate='';renderCalendar();renderSlabTable();">전체 목록 보기</button>
+          </div>
+          <div class="cal-grid" id="slab-calendar"></div>
+          <div style="font-size:11px;color:#991b1b;margin-top:4px;">* 입고/이월 기록이 있는 날짜는 옅은 빨간색으로 표시됩니다.</div>
+        </div>
+        <div style="flex:1;min-width:320px;">
+          <input type="hidden" id="edit-slab-id">
+          <div class="form-row">
+            <label style="font-size:12.5px;background:#dbeafe;color:#1e40af;padding:6px 10px;border-radius:6px;font-weight:bold;cursor:pointer;">
+              <input type="checkbox" id="slab-carryover" onchange="toggleSlabCarryoverMode()"> 📦 전월(이전달) 이월 슬랍으로 등록 (당월 구매KG 제외 및 재고 반영)
+            </label>
+          </div>
+          <div class="form-row">
+            <input type="date" id="slab-date">
+            <select id="slab-meat" onchange="updateSlabProductSelect()">
+              <option value="돼지고기">돼지고기</option>
+              <option value="소고기">소고기</option>
+              <option value="닭고기">닭고기</option>
+            </select>
+            <input id="slab-cut" placeholder="부위 (예: 삼겹살, 목살)">
+            <select id="slab-product-id" style="min-width:185px;"><option value="">연관 상품 선택</option></select>
+            <input id="slab-no" placeholder="슬랍 번호 (예: 10월이월-1)">
+          </div>
+          <div class="form-row">
+            <input type="number" step="0.001" id="slab-kg" placeholder="슬랍 KG">
+            <input type="number" step="0.01" id="slab-buy100" placeholder="매입가(100g당 ₱)">
+            <button class="btn primary" onclick="saveSlab()">저장 / 수정반영</button>
+            <button class="btn" onclick="resetSlabForm()">취소</button>
+          </div>
+          <div id="slab-history-box" style="margin-top:12px;padding:10px;background:#f8fafc;border:1px solid var(--border);border-radius:8px;">
+            <b>슬랍 행을 클릭하면 해당 슬랍의 생산·트림 히스토리가 표시됩니다.</b>
+          </div>
+        </div>
+      </div>
+      <div style="margin-top:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <h3 style="margin:0;font-size:14px;">슬랍(원물) 입고·이월 목록 (행을 클릭하면 수정 폼으로 로드됩니다)</h3>
+        <div class="form-row" style="margin:0;">
+          <label style="font-size:12.5px;font-weight:bold;">육종별 목록 필터:</label>
+          <select id="slab-table-meat-filter" onchange="renderSlabTable()">
+            <option value="전체">전체 (돼지고기·소고기·닭고기)</option>
+            <option value="돼지고기">돼지고기</option>
+            <option value="소고기">소고기</option>
+            <option value="닭고기">닭고기</option>
+          </select>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr><th>기준일</th><th>구분</th><th>육종</th><th>부위</th><th>연관상품</th><th>슬랍번호</th><th>최초KG</th><th>잔량KG</th><th>매입가/kg</th><th>상태</th><th>관리</th></tr>
+        </thead>
+        <tbody id="slab-table-body"></tbody>
+      </table>
+    </div>
+
+    <!-- ② 생산 관리 -->
+    <div id="slab-subtab-production" class="panel" style="display:none;">
+      <h2>② 슬랍 → 팩 생산 등록·수정·삭제 (슬랍 및 팩 재고 실시간 연동)</h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:16px;">
+        <div>
+          <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
+            <input type="month" id="prod-cal-month" onchange="renderProductionCalendar()">
+            <button class="btn" onclick="selectedProdCalDate='';renderProductionCalendar();renderProductionTable();">전체 목록 보기</button>
+          </div>
+          <div class="cal-grid" id="production-calendar"></div>
+          <div style="font-size:11px;color:#1e40af;margin-top:4px;">* 생산 기록이 있는 날짜는 파란색/초록색으로 표시됩니다.</div>
+        </div>
+        <div style="flex:1;min-width:340px;">
+          <input type="hidden" id="edit-prod-run-id">
+          <div class="form-row">
+            <input type="date" id="prod-run-date">
+            <select id="prod-filter-meat" onchange="filterSlabSelectByMeat(); updateProductionProductOptions();">
+              <option value="돼지고기">돼지고기</option>
+              <option value="소고기">소고기</option>
+              <option value="닭고기">닭고기</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <select id="prod-slab-select" style="min-width:260px;"></select>
+            <select id="prod-out-product" style="min-width:200px;"></select>
+          </div>
+          <div class="form-row">
+            <input type="number" step="0.001" id="prod-in-kg" placeholder="원육 투입 KG" oninput="calcProdUnitKg()">
+            <input type="number" id="prod-pack-qty" placeholder="생산 팩 수" oninput="calcProdUnitKg()">
+            <input type="number" step="0.001" id="prod-pack-unit" placeholder="1팩당 KG" style="background:#f0fdf4;border-color:#16a34a;font-weight:bold;color:#166534;" readonly>
+            <button class="btn primary" onclick="submitProduction()">생산 반영 / 수정저장</button>
+            <button class="btn" onclick="resetProductionForm()">취소</button>
+          </div>
+        </div>
+      </div>
+      <h3 style="margin-top:14px;font-size:14px;">생산 반영 히스토리 목록 (행을 클릭하면 수정 폼으로 로드됩니다)</h3>
+      <table>
+        <thead>
+          <tr><th>기준일</th><th>육종</th><th>투입 슬랍</th><th>생산 상품</th><th>투입KG</th><th>생산팩수</th><th>1팩당KG</th><th>생산KG</th><th>관리</th></tr>
+        </thead>
+        <tbody id="production-table-body"></tbody>
+      </table>
+    </div>
+
+    <!-- ③ 트림 관리 -->
+    <div id="slab-subtab-trim" class="panel" style="display:none;">
+      <h2>③ 트림 관리</h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:16px;">
+        <div>
+          <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
+            <input type="month" id="trim-cal-month" onchange="renderTrimCalendar()">
+            <button class="btn" onclick="selectedTrimCalDate='';renderTrimCalendar();renderTrimTable();">전체 목록 보기</button>
+          </div>
+          <div class="cal-grid" id="trim-calendar"></div>
+          <div style="font-size:11px;color:#92400e;margin-top:4px;">* 트림 기록이 있는 날짜는 주황색으로 표시됩니다.</div>
+        </div>
+        <div style="flex:1;min-width:340px;">
+          <input type="hidden" id="edit-trim-id">
+          <div class="form-row">
+            <input type="date" id="trim-date">
+            <select id="trim-filter-meat" onchange="filterTrimSlabByMeat()">
+              <option value="전체">모든 육종</option>
+              <option value="돼지고기">돼지고기</option>
+              <option value="소고기">소고기</option>
+              <option value="닭고기">닭고기</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <select id="trim-slab-select" style="min-width:260px;"></select>
+            <select id="trim-prod-select" style="min-width:200px;"><option value="">연관 상품(미선택 시 슬랍부위 자동연결)</option></select>
+          </div>
+          <div class="form-row">
+            <input type="number" step="0.001" id="trim-kg" placeholder="트림 KG">
+            <input id="trim-note" placeholder="메모" style="min-width:180px;">
+            <button class="btn primary" id="btn-trim-submit" onclick="submitTrim()">트림 등록</button>
+            <button class="btn" id="btn-trim-cancel" style="display:none;" onclick="resetTrimForm()">수정 취소</button>
+          </div>
+        </div>
+      </div>
+      <h3 style="margin-top:14px;font-size:14px;">트림 등록 히스토리 목록 (행을 클릭하면 수정 폼으로 로드됩니다)</h3>
+      <table>
+        <thead>
+          <tr><th>기준일</th><th>육종</th><th>대상 슬랍</th><th>연관 상품</th><th>트림 KG</th><th>손실 환산액(₱)</th><th>메모</th><th>관리</th></tr>
+        </thead>
+        <tbody id="trim-table-body"></tbody>
+      </table>
+    </div>
+
+    <!-- ④ 폐기 관리 -->
+    <div id="slab-subtab-waste" class="panel" style="display:none;">
+      <h2>④ 폐기 관리</h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:16px;">
+        <div>
+          <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
+            <input type="month" id="waste-cal-month" onchange="renderWasteCalendar()">
+            <button class="btn" onclick="selectedWasteCalDate='';renderWasteCalendar();renderWasteTable();">전체 목록 보기</button>
+          </div>
+          <div class="cal-grid" id="waste-calendar"></div>
+          <div style="font-size:11px;color:#991b1b;margin-top:4px;">* 폐기 기록이 있는 날짜는 빨간색으로 표시됩니다.</div>
+        </div>
+        <div style="flex:1;min-width:340px;">
+          <input type="hidden" id="edit-waste-id">
+          <div class="form-row">
+            <input type="date" id="waste-date">
+            <select id="waste-meat" onchange="updateWasteProducts()">
+              <option value="돼지고기">돼지고기</option>
+              <option value="소고기">소고기</option>
+              <option value="닭고기">닭고기</option>
+            </select>
+            <select id="waste-prod" style="min-width:210px;"></select>
+          </div>
+          <div class="form-row">
+            <select id="waste-source"><option value="pack">팩 재고에서 차감</option><option value="slab">슬랍 재고에서 차감</option></select>
+            <input type="number" step="0.001" id="waste-kg" placeholder="폐기 KG">
+            <input type="number" id="waste-packs" placeholder="폐기 팩 수(선택)">
+          </div>
+          <div class="form-row">
+            <input id="waste-note" placeholder="폐기 사유" style="min-width:220px;">
+            <button class="btn warn" id="btn-waste-submit" onclick="submitWaste()">폐기 등록 및 재고 차감</button>
+            <button class="btn" id="btn-waste-cancel" style="display:none;" onclick="resetWasteForm()">수정 취소</button>
+          </div>
+        </div>
+      </div>
+      <h3 style="margin-top:14px;font-size:14px;">폐기 등록 히스토리 목록 (행을 클릭하면 수정 폼으로 로드됩니다)</h3>
+      <table>
+        <thead>
+          <tr><th>기준일</th><th>육종</th><th>상품명</th><th>차감대상</th><th>폐기 KG</th><th>폐기 팩수</th><th>손실 환산액(₱)</th><th>폐기 사유(메모)</th><th>관리</th></tr>
+        </thead>
+        <tbody id="waste-table-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 4. 판매 엑셀 등록·관리 -->
+  <section id="tab-sales" style="display:none;">
+    <div class="panel">
+      <h2>
+        <span>판매 엑셀 등록 (달력 등록일 체크 표시 & 즉시 실행 취소 지원)</span>
+        <button class="btn undo" onclick="undoLastSales()">↩ 방금 실행한 판매 엑셀 취소(원복)</button>
+      </h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;">
+        <div>
+          <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
+            <input type="month" id="sales-cal-month" onchange="renderSalesCalendar()">
+            <span style="font-size:11.5px;color:#166534;font-weight:bold;">✔ 초록색 날짜 = 판매 등록 완료일</span>
+          </div>
+          <div class="cal-grid" id="sales-calendar"></div>
+        </div>
+        <div style="flex:1;min-width:300px;">
+          <p style="font-size:12.5px;color:#475569;margin-top:0;">
+            • 달력에서 날짜를 클릭하거나 <b>기준 판매일</b>을 선택한 뒤 엑셀 파일을 올리세요.<br>
+            • 시트명 <code>1031</code>(11월1일) 선택 시 하루 전인 <b>1031(10월31일)</b> 기준으로 재고가 차감되며 달력에 ✔ 체크됩니다.<br>
+            • 마이너스(-) 수량/중량(반품 등)이 포함된 엑셀이나 개별 수정도 자동 지원됩니다.
+          </p>
+          <div class="form-row">
+            <label>기준 판매일: <input type="date" id="sales-cal-date" onchange="syncSalesMonthFromDate()"></label>
+            <input type="file" id="sales-file" accept=".xlsx,.xls" onchange="previewSalesExcel()">
+          </div>
+        </div>
+      </div>
+
+      <div id="sales-preview-box" style="display:none;margin-top:12px;">
+        <div id="sales-meta" style="padding:10px;background:#eff6ff;border-radius:8px;margin-bottom:10px;font-size:13px;"></div>
+        <table>
+          <thead><tr><th>행</th><th>엑셀 품명</th><th>매칭 상품</th><th>QTY(팩)</th><th>KG</th><th>금액(₱)</th><th>판매KG당 금액(₱)</th><th>제외</th></tr></thead>
+          <tbody id="sales-preview-body"></tbody>
+        </table>
+        <div style="margin-top:10px;">
+          <button class="btn primary" onclick="applySalesExcel()">판매 반영 및 재고 차감 실행</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>판매 엑셀 실행 히스토리 (행을 클릭하여 품목별 수정·삭제 및 전체 실행 취소)</h2>
+      <table>
+        <thead><tr><th>실행일시</th><th>파일명</th><th>시트명(판매일)</th><th>재고 차감일</th><th>총 QTY</th><th>총 KG</th><th>총 금액(₱)</th><th>관리</th></tr></thead>
+        <tbody id="sales-history-body"></tbody>
+      </table>
+    </div>
+
+    <!-- 선택된 판매 실행 내역 상세 수정/삭제 패널 -->
+    <div id="sales-detail-panel" class="panel" style="display:none;border:2px solid #2563eb;">
+      <h2>
+        <span id="sales-detail-title">선택된 판매 실행 상세 내역</span>
+        <button class="btn" onclick="closeSalesDetail()">닫기</button>
+      </h2>
+      <div class="form-row" style="background:#f8fafc;padding:10px;border-radius:8px;">
+        <b style="font-size:12.5px;">+ 누락된 판매 품목 추가 (음수 입력 시 반품 처리):</b>
+        <select id="sales-add-prod" style="min-width:210px;"></select>
+        <input type="number" id="sales-add-qty" placeholder="QTY(팩)" style="width:90px;">
+        <input type="number" step="0.001" id="sales-add-kg" placeholder="KG (비우면 자동계산)" style="width:155px;">
+        <input type="number" step="0.01" id="sales-add-amt" placeholder="판매금액(₱)" style="width:125px;">
+        <button class="btn primary" onclick="addSalesDetailRow()">항목 추가 및 재고반영</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>매칭 상품 변경</th><th>QTY(팩)</th><th>판매 중량(KG)</th><th>판매금액(₱)</th><th>KG당 단가</th><th>비고</th><th>수정 / 삭제</th>
+          </tr>
+        </thead>
+        <tbody id="sales-detail-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 5. 기간별 보고서 -->
+  <section id="tab-report" style="display:none;">
+    <div class="panel">
+      <h2>
+        <span>기간별 통합 보고서 (전월이월 KG 및 안전재고 7kg 기준 평가)</span>
+        <button class="btn excel" onclick="exportExcel('report')">📥 조회 기간 보고서 엑셀(.xlsx) 다운로드</button>
+      </h2>
+      <div class="form-row">
+        <input type="date" id="rep-start">
+        <span>~</span>
+        <input type="date" id="rep-end">
+        <select id="rep-meat" onchange="loadReport()"><option>전체</option><option>돼지고기</option><option>소고기</option><option>닭고기</option></select>
+        <select id="rep-prod-select" style="min-width:220px;" onchange="selectReportProduct(this.value)">
+          <option value="">-- 전체 품목 요약 (상세내역을 보려면 품목 선택) --</option>
+        </select>
+        <label>고정 보정로스율(%): <input type="number" step="0.1" id="set-loss-rate" style="width:75px;"></label>
+        <label>기본 마진율(%): <input type="number" step="0.1" id="set-margin-rate" style="width:75px;"></label>
+        <button class="btn" onclick="saveRates()">비율 저장</button>
+        <button class="btn primary" onclick="loadReport()">보고서 조회</button>
+      </div>
+      
+      <!-- 육종별 순구매 및 금액 통계 카드 (돼지고기/소고기/닭고기) -->
+      <div id="meat-summary-cards" class="grid-4" style="margin-bottom:14px;"></div>
+
+      <div class="grid-4" id="report-kpi-cards"></div>
+      <table>
+        <thead>
+          <tr>
+            <th>파트</th><th>상품명</th><th>매입가</th><th>보정단가</th><th>판매가</th>
+            <th>전월이월(KG)</th><th>당기구매</th><th>구매금액(₱)</th><th>판매(팩/KG)</th><th>총판매액(₱)</th>
+            <th>슬랍재고</th><th>팩재고(팩수)</th><th>총재고(안전7kg)</th>
+            <th>예상로스</th><th>트림KG</th><th>폐기KG</th><th>실로스KG</th><th>실로스율</th><th>로스손실액</th>
+            <th>수익률</th><th>수익률 vs 실로스율</th>
+          </tr>
+        </thead>
+        <tbody id="report-body"></tbody>
+      </table>
+    </div>
+
+    <div id="report-detail-panel" class="panel" style="display:none;border:2px solid #2563eb;">
+      <h2>
+        <span id="report-detail-title">선택 품목 상세 손실 및 재고 현황</span>
+        <button class="btn" onclick="closeReportDetail()">닫기</button>
+      </h2>
+      <div class="grid-5" id="report-detail-cards"></div>
+      <table>
+        <thead>
+          <tr>
+            <th>기준일</th><th>구분</th><th>발생 출처 / 대상</th><th>수량(팩)</th>
+            <th>슬랍변동(KG)</th><th>팩변동(KG)</th><th>트림(KG)</th><th>폐기(KG)</th><th>실로스합계(KG)</th><th>상세 내역(메모)</th>
+          </tr>
+        </thead>
+        <tbody id="report-detail-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 6. 전체 작업 이력·복구·백업 -->
+  <section id="tab-history" style="display:none;">
+    <div class="panel">
+      <h2>데이터 백업 (JSON 파일 다운로드) & 복원 (JSON 파일 업로드)</h2>
+      <div class="form-row">
+        <button class="btn primary" onclick="exportBackupJson()">📥 전체 데이터 백업 파일(JSON) 다운로드</button>
+        <input type="file" id="backup-file" accept=".json" style="display:none;" onchange="importBackupJson(event)">
+        <button class="btn warn" onclick="document.getElementById('backup-file').click()">📤 백업 파일(JSON)로 데이터 복원하기</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>시점 복구 (실수했을 때 이전 단계로 전체 데이터 리커버리)</h2>
+      <table>
+        <thead><tr><th>시점</th><th>작업 내용</th><th>이시점 복구</th><th>삭제</th></tr></thead>
+        <tbody id="snapshot-body"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>상세 입출고·생산·트림·폐기·판매 작업 이력 (행을 클릭하면 수정 팝업 또는 폼으로 연결됩니다)</h2>
+      <table>
+        <thead><tr><th>기준일</th><th>구분</th><th>상품/슬랍</th><th>QTY</th><th>KG 변동</th><th>총 금액(₱)</th><th>판매KG당 단가</th><th>메모</th><th>관리</th></tr></thead>
+        <tbody id="history-body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+let STATE = null;
+let prodPartFilter = '전체';
+let selectedCalDate = '';
+let selectedProdCalDate = '';
+let selectedRecCalDate = '';
+let selectedTrimCalDate = '';
+let selectedWasteCalDate = '';
+let salesPreviewData = null;
+let lastReportRows = [];
+let selectedReportProdId = '';
+
+function getLocalToday() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function getPrevMonthLastDay() {
+  const now = new Date();
+  const lastDayPrevMonth = new Date(now.getFullYear(), now.getMonth(), 0);
+  const y = lastDayPrevMonth.getFullYear();
+  const m = String(lastDayPrevMonth.getMonth() + 1).padStart(2, '0');
+  const d = String(lastDayPrevMonth.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function fmt(n) { return Number(n || 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function fmtKg(n) { return Number(n || 0).toFixed(3); }
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 3200);
+}
+
+function showTab(id, btn) {
+  document.querySelectorAll('main > section').forEach(s => s.style.display = 'none');
+  document.getElementById('tab-' + id).style.display = 'block';
+  document.querySelectorAll('aside .nav').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  document.getElementById('page-title').textContent = btn ? btn.textContent : id;
+  loadState().then(() => {
+    if (id === 'report') loadReport();
+  });
+}
+
+async function loadState() {
+  const res = await fetch('/api/state?_t=' + Date.now(), {cache: 'no-store'});
+  STATE = await res.json();
+  document.getElementById('db-info').textContent = `DB 파일: ${STATE.db_path} (동기화: ${STATE.server_ts})`;
+  document.getElementById('set-loss-rate').value = STATE.settings.fixed_loss_rate || 20;
+  document.getElementById('set-margin-rate').value = STATE.settings.margin_rate || 35;
+
+  renderDashboard();
+  renderProducts();
+  renderReceivingCalendar();
+  renderReceivingTable();
+  renderSlabSection();
+  renderSalesCalendar();
+  renderSalesHistory();
+  renderHistory();
+}
+
+async function forceRefreshAll() {
+  await loadState();
+  if (document.getElementById('tab-report').style.display !== 'none') {
+    await loadReport();
+  }
+  toast('최신 데이터 및 전체 내역이 새로고침되었습니다.');
+}
+
+function renderDashboard() {
+  const dashDateEl = document.getElementById('dash-target-date');
+  if (!dashDateEl.value) dashDateEl.value = getLocalToday();
+  const targetDateStr = dashDateEl.value;
+  const monthStr = targetDateStr.slice(0, 7);
+  document.getElementById('month-label').textContent = monthStr;
+
+  const todayMovs = STATE.movements.filter(m => (m.date || '').startsWith(targetDateStr));
+  const monthMovs = STATE.movements.filter(m => (m.date || '').startsWith(monthStr));
+
+  const tBuy = todayMovs.filter(m => m.type === 'product_receiving' || m.type === 'slab_inbound').reduce((a, b) => a + (b.kg_delta || 0), 0);
+  const tSaleMovs = todayMovs.filter(m => m.type === 'sale');
+  const tSaleQty = tSaleMovs.reduce((a, b) => a + (b.qty || 0), 0);
+  const tSaleKg = tSaleMovs.reduce((a, b) => a + (-b.kg_delta || 0), 0);
+  const tLoss = todayMovs.reduce((a, b) => a + (b.trim_kg || 0) + (b.waste_kg || 0), 0);
+  const tAmt = tSaleMovs.reduce((a, b) => a + (b.amount || 0), 0);
+
+  document.getElementById('today-cards').innerHTML = `
+    <div class="card" onclick="openSummaryDetailModal('today_inbound', '${targetDateStr}')"><small>${targetDateStr} 순수 입고 KG (클릭시 상세)</small><strong>${fmtKg(tBuy)} KG</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('today_sale_qty', '${targetDateStr}')"><small>${targetDateStr} 판매 수량 (클릭시 상세)</small><strong>${tSaleQty.toLocaleString()} 팩</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('today_sale_kg', '${targetDateStr}')"><small>${targetDateStr} 판매 중량 (클릭시 상세)</small><strong>${fmtKg(tSaleKg)} KG</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('today_loss', '${targetDateStr}')"><small>${targetDateStr} 트림·폐기 로스 (클릭시 상세)</small><strong>${fmtKg(tLoss)} KG</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('today_sale_amt', '${targetDateStr}')"><small>${targetDateStr} 판매액 (클릭시 상세)</small><strong>₱ ${fmt(tAmt)}</strong></div>
+  `;
+
+  const mBuy = monthMovs.filter(m => m.type === 'product_receiving' || m.type === 'slab_inbound').reduce((a, b) => a + (b.kg_delta || 0), 0);
+  const mSaleMovs = monthMovs.filter(m => m.type === 'sale');
+  const mSaleQty = mSaleMovs.reduce((a, b) => a + (b.qty || 0), 0);
+  const mSaleKg = mSaleMovs.reduce((a, b) => a + (-b.kg_delta || 0), 0);
+  const mLoss = monthMovs.reduce((a, b) => a + (b.trim_kg || 0) + (b.waste_kg || 0), 0);
+  const mAmt = mSaleMovs.reduce((a, b) => a + (b.amount || 0), 0);
+
+  document.getElementById('month-cards').innerHTML = `
+    <div class="card" onclick="openSummaryDetailModal('month_inbound', '${monthStr}')"><small>${monthStr} 당월 순구매 KG (클릭시 상세)</small><strong>${fmtKg(mBuy)} KG</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('month_sale_qty', '${monthStr}')"><small>${monthStr} 총 판매 수량 (클릭시 상세)</small><strong>${mSaleQty.toLocaleString()} 팩</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('month_sale_kg', '${monthStr}')"><small>${monthStr} 총 판매 중량 (클릭시 상세)</small><strong>${fmtKg(mSaleKg)} KG</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('month_loss', '${monthStr}')"><small>${monthStr} 총 트림·폐기 (클릭시 상세)</small><strong>${fmtKg(mLoss)} KG</strong></div>
+    <div class="card" onclick="openSummaryDetailModal('month_sale_amt', '${monthStr}')"><small>${monthStr} 총 판매액 (클릭시 상세)</small><strong>₱ ${fmt(mAmt)}</strong></div>
+  `;
+
+  const monthSaleByProd = {};
+  mSaleMovs.forEach(m => {
+    if (!m.product_id) return;
+    if (!monthSaleByProd[m.product_id]) monthSaleByProd[m.product_id] = {qty: 0, kg: 0};
+    monthSaleByProd[m.product_id].qty += (m.qty || 0);
+    monthSaleByProd[m.product_id].kg += (-m.kg_delta || 0);
+  });
+
+  const searchQ = (document.getElementById('dash-search').value || '').toLowerCase();
+  const partFilter = document.getElementById('dash-part-filter').value;
+  const lowOnly = document.getElementById('dash-low-only').checked;
+
+  let lowCount = 0;
+  STATE.products.forEach(p => {
+    if ((p.slab_stock_kg + p.pack_stock_kg) <= 7.0) lowCount++;
+  });
+  document.getElementById('low-stock-alert').textContent = lowCount > 0 ? `⚠ 안전재고(7kg) 이하 품목: ${lowCount}개` : '✔ 전 품목 안전재고(7kg) 양호';
+
+  const filtered = STATE.products.filter(p => {
+    const tot = p.slab_stock_kg + p.pack_stock_kg;
+    const isLow = tot <= 7.0;
+    if (partFilter !== '전체' && p.category !== partFilter) return false;
+    if (lowOnly && !isLow) return false;
+    if (searchQ && !p.name.toLowerCase().includes(searchQ) && !p.cut.toLowerCase().includes(searchQ)) return false;
+    return true;
+  });
+
+  const tbody = document.getElementById('dash-stock-body');
+  tbody.innerHTML = filtered.map(p => {
+    const tot = p.slab_stock_kg + p.pack_stock_kg;
+    const minKg = 7.0;
+    const isLow = tot <= minKg;
+    const val = tot * p.sale_per_kg;
+    const ms = monthSaleByProd[p.id] || {qty: 0, kg: 0};
+    const isNegative = tot < 0;
+    return `<tr class="${isNegative ? 'zero-kg' : (isLow ? 'low-stock' : '')}">
+      <td>${p.category}</td><td>${p.cut}</td>
+      <td><span class="clickable-product" onclick="openProductDetailModal(${p.id})"><b>${p.name}</b> 🔍이력</span></td>
+      <td>${fmtKg(p.slab_stock_kg)}</td><td>${fmtKg(p.pack_stock_kg)}</td><td>${p.pack_count} 팩</td>
+      <td><b>${fmtKg(tot)}</b></td>
+      <td><span class="badge ${isLow ? 'low' : 'ok'}">${isLow ? '부족' : '정상'} (7.0kg)</span></td>
+      <td><b>${ms.qty}팩</b> / ${fmtKg(ms.kg)}kg</td>
+      <td>₱ ${fmt(p.sale_per_kg)}</td><td>₱ ${fmt(val)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function openSummaryDetailModal(categoryKey, dateStr) {
+  let matchedMovs = [];
+  let titleStr = '';
+
+  if (categoryKey.includes('inbound')) {
+    const isMonth = categoryKey.startsWith('month');
+    titleStr = `${isMonth ? dateStr + ' 월누적' : dateStr} 순수 입고(구매) 상세 내역`;
+    matchedMovs = STATE.movements.filter(m => (m.type === 'product_receiving' || m.type === 'slab_inbound') && (isMonth ? (m.date || '').startsWith(dateStr) : (m.date || '').slice(0, 10) === dateStr));
+  } else if (categoryKey.includes('sale')) {
+    const isMonth = categoryKey.startsWith('month');
+    titleStr = `${isMonth ? dateStr + ' 월누적' : dateStr} 판매 상세 내역`;
+    matchedMovs = STATE.movements.filter(m => m.type === 'sale' && (isMonth ? (m.date || '').startsWith(dateStr) : (m.date || '').slice(0, 10) === dateStr));
+  } else if (categoryKey.includes('loss')) {
+    const isMonth = categoryKey.startsWith('month');
+    titleStr = `${isMonth ? dateStr + ' 월누적' : dateStr} 트림·폐기 로스 상세 내역`;
+    matchedMovs = STATE.movements.filter(m => (m.type === 'waste' || m.type === 'trim') && (isMonth ? (m.date || '').startsWith(dateStr) : (m.date || '').slice(0, 10) === dateStr));
+  }
+
+  document.getElementById('summary-modal-title').textContent = titleStr;
+  const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+
+  const tbody = document.getElementById('summary-modal-body');
+  if (!matchedMovs.length) {
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#64748b;padding:20px;">해당 조건의 이력이 없습니다.</td></tr>`;
+  } else {
+    tbody.innerHTML = matchedMovs.map(m => {
+      const pName = prodMap[m.product_id] || (m.slab_id ? `슬랍 #${m.slab_id}` : '-');
+      const kgVal = m.kg_delta !== 0 ? m.kg_delta : (m.trim_kg || m.waste_kg || 0);
+      return `<tr class="clickable-row" onclick="jumpToEditFromSummary(${m.id}, '${m.type}')">
+        <td>${m.date}</td>
+        <td><span class="badge ok">${m.type}</span></td>
+        <td><b>${pName}</b></td>
+        <td>${m.qty || 0} 팩</td>
+        <td><b>${fmtKg(kgVal)} KG</b></td>
+        <td>₱ ${fmt(m.amount || 0)}</td>
+        <td>${m.note || ''}</td>
+        <td><button class="btn primary" style="padding:3px 8px;font-size:11px;">수정/관리로 이동</button></td>
+      </tr>`;
+    }).join('');
+  }
+  document.getElementById('summary-detail-modal').style.display = 'flex';
+}
+
+function closeSummaryModal() {
+  document.getElementById('summary-detail-modal').style.display = 'none';
+}
+
+function jumpToEditFromSummary(movId, movType) {
+  closeSummaryModal();
+  closeProductModal();
+  closeSlabSummaryModal();
+  const m = STATE.movements.find(x => x.id === movId);
+  if (!m) return;
+
+  if (m.type === 'product_receiving' || m.type === 'carryover_inbound') {
+    showTab('products', document.querySelectorAll('aside .nav')[1]);
+    editReceiveMovement(m);
+  } else if (m.type === 'slab_inbound' || m.type === 'slab_carryover') {
+    showTab('slabs', document.querySelectorAll('aside .nav')[2]);
+    showSlabSubTab('inbound', document.querySelectorAll('#tab-slabs .subtabs button')[0]);
+    const slab = STATE.slabs.find(s => s.id === m.slab_id);
+    if (slab) editSlab(slab);
+  } else if (m.type === 'slab_production') {
+    showTab('slabs', document.querySelectorAll('aside .nav')[2]);
+    showSlabSubTab('production', document.querySelectorAll('#tab-slabs .subtabs button')[1]);
+    editProduction(m);
+  } else if (m.type === 'trim') {
+    showTab('slabs', document.querySelectorAll('aside .nav')[2]);
+    showSlabSubTab('trim', document.querySelectorAll('#tab-slabs .subtabs button')[2]);
+    editTrimMovement(m);
+  } else if (m.type === 'waste') {
+    showTab('slabs', document.querySelectorAll('aside .nav')[2]);
+    showSlabSubTab('waste', document.querySelectorAll('#tab-slabs .subtabs button')[3]);
+    editWasteMovement(m);
+  } else if (m.type === 'sale') {
+    showTab('sales', document.querySelectorAll('aside .nav')[3]);
+    const matchedImport = STATE.sales_imports.find(si => m.note.includes(si.sheet_name) || si.deduct_date === m.date);
+    if (matchedImport) openSalesDetail(matchedImport.id);
+  } else {
+    showTab('history', document.querySelectorAll('aside .nav')[5]);
+  }
+}
+
+async function openProductDetailModal(pid) {
+  const res = await fetch(`/api/products/history/${pid}?_t=${Date.now()}`, {cache: 'no-store'});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+
+  const prod = data.product;
+  const movs = data.movements;
+  
+  document.getElementById('modal-product-title').textContent = `[${prod.category}] ${prod.name} 상세 이력 및 판매 기록`;
+  
+  const totStock = prod.slab_stock_kg + prod.pack_stock_kg;
+  document.getElementById('modal-product-summary').innerHTML = `
+    <div class="card" style="padding:10px;"><small>총 재고</small><strong>${fmtKg(totStock)} KG</strong></div>
+    <div class="card" style="padding:10px;"><small>팩 재고</small><strong>${fmtKg(prod.pack_stock_kg)} KG (${prod.pack_count}팩)</strong></div>
+    <div class="card" style="padding:10px;"><small>슬랍 재고</small><strong>${fmtKg(prod.slab_stock_kg)} KG</strong></div>
+    <div class="card" style="padding:10px;"><small>판매가</small><strong>₱ ${fmt(prod.sale_per_kg)}/kg</strong></div>
+  `;
+
+  const typeLabels = {
+    "product_receiving": "상품입고", "carryover_inbound": "전월이월(상품)",
+    "slab_inbound": "슬랍입고", "slab_carryover": "전월이월(슬랍)",
+    "slab_production": "생산반영", "trim": "트림", "waste": "폐기", "sale": "판매차감"
+  };
+
+  const tbody = document.getElementById('modal-product-history-body');
+  if (!movs.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#64748b;padding:20px;">등록된 입출고 및 판매 이력이 없습니다.</td></tr>`;
+  } else {
+    tbody.innerHTML = movs.map(m => {
+      const isSale = m.type === 'sale';
+      const isReceive = m.type.includes('receiving') || m.type.includes('inbound') || m.type.includes('carryover');
+      const badgeCls = isSale ? 'badge ok' : (isReceive ? 'badge carry' : 'badge low');
+      return `<tr class="clickable-row ${isSale ? 'done-row' : ''}" onclick="jumpToEditFromSummary(${m.id}, '${m.type}')">
+        <td>${m.date} <br><small style="color:#64748b;">${m.created_at || ''}</small></td>
+        <td><span class="${badgeCls}">${typeLabels[m.type] || m.type}</span></td>
+        <td><b>${m.qty || 0} 팩</b></td>
+        <td><b>${fmtKg(m.kg_delta || 0)} KG</b></td>
+        <td>₱ ${fmt(m.unit_price || m.price_per_kg || 0)}</td>
+        <td><b>₱ ${fmt(m.amount || 0)}</b></td>
+        <td>${m.note || ''} <span style="color:#2563eb;font-size:11px;font-weight:bold;">[수정하기 ➔]</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  document.getElementById('product-modal').style.display = 'flex';
+}
+
+function closeProductModal() {
+  document.getElementById('product-modal').style.display = 'none';
+}
+
+function openSlabSummaryModal(filterType) {
+  let slabsList = STATE.slabs;
+  let title = "전체 슬랍 원물 현황";
+
+  if (filterType === 'total_kg') {
+    title = "보유중인 전체 슬랍 상세 목록 (잔여 KG 기준)";
+    slabsList = STATE.slabs.filter(s => s.remaining_kg > 0.0001);
+  } else if (filterType === 'count') {
+    title = "전체 등록 슬랍 개수 목록";
+  } else if (filterType === 'loss') {
+    title = "누적 트림·폐기 관련 슬랍 이력";
+  } else if (filterType === 'trim') {
+    title = "누적 트림 이력 대상 슬랍 목록";
+  }
+
+  document.getElementById('slab-summary-modal-title').textContent = title;
+  const tbody = document.getElementById('slab-summary-modal-body');
+  if (!slabsList.length) {
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#64748b;padding:20px;">등록된 슬랍이 없습니다.</td></tr>`;
+  } else {
+    tbody.innerHTML = slabsList.map(s => {
+      const isZero = s.remaining_kg <= 0.0001;
+      return `<tr class="clickable-row ${isZero ? 'zero-kg' : ''}" onclick="closeSlabSummaryModal(); editSlab(${JSON.stringify(s)})">
+        <td>${s.date} ${s.is_carryover ? '(이월)' : ''}</td>
+        <td><b>${s.meat_type}</b></td>
+        <td>${s.cut}</td>
+        <td>#${s.slab_no || s.id}</td>
+        <td>${fmtKg(s.kg)} KG</td>
+        <td><b>${fmtKg(s.remaining_kg)} KG</b></td>
+        <td>₱ ${fmt(s.buy_price_kg)}</td>
+        <td><span class="badge ${isZero ? 'low' : 'ok'}">${isZero ? '소진' : '보유중'}</span></td>
+      </tr>`;
+    }).join('');
+  }
+  document.getElementById('slab-summary-modal').style.display = 'flex';
+}
+
+function closeSlabSummaryModal() {
+  document.getElementById('slab-summary-modal').style.display = 'none';
+}
+
+function updateCatalogCuts() {
+  const cat = document.getElementById('prod-cat').value;
+  const cuts = Object.keys(STATE.catalog[cat] || {});
+  document.getElementById('prod-cut').innerHTML = cuts.map(c => `<option>${c}</option>`).join('');
+  updateCatalogNames();
+}
+
+function updateCatalogNames() {
+  const cat = document.getElementById('prod-cat').value;
+  const cut = document.getElementById('prod-cut').value;
+  const names = (STATE.catalog[cat] || {})[cut] || [];
+  document.getElementById('prod-preset').innerHTML = '<option value="">카탈로그 상품 선택</option>' + names.map(n => `<option>${n}</option>`).join('');
+}
+
+function updateReceiveProductOptions() {
+  const meat = document.getElementById('rec-meat').value;
+  const matched = STATE.products.filter(p => p.category === meat);
+  document.getElementById('rec-prod').innerHTML = matched.map(p => `<option value="${p.id}">[${p.category}] ${p.name}</option>`).join('');
+}
+
+function previewCalcPrice() {
+  const b100 = parseFloat(document.getElementById('prod-buy100').value) || 0;
+  const loss = parseFloat(STATE.settings.fixed_loss_rate || 20);
+  const margin = parseFloat(STATE.settings.margin_rate || 35);
+  const bKg = b100 * 10;
+  const adj = bKg / (1 - loss / 100);
+  const sale = adj * (1 + margin / 100);
+  document.getElementById('prod-adj').value = adj.toFixed(2);
+  document.getElementById('prod-sale').value = sale.toFixed(2);
+  document.getElementById('price-preview').textContent = `자동계산: KG당 매입가 ₱${fmt(bKg)} | 보정단가(로스 ${loss}% 반영) ₱${fmt(adj)} | 권장 판매가(마진 ${margin}%) ₱${fmt(sale)}`;
+}
+
+function renderProducts() {
+  updateCatalogCuts();
+  updateReceiveProductOptions();
+  const tbody = document.getElementById('prod-table-body');
+  tbody.innerHTML = STATE.products
+    .filter(p => prodPartFilter === '전체' || p.category === prodPartFilter)
+    .map(p => {
+      const tot = p.slab_stock_kg + p.pack_stock_kg;
+      const val = tot * p.sale_per_kg;
+      const isNegative = tot < 0;
+      return `<tr class="${isNegative ? 'zero-kg' : ''}">
+        <td>${p.category}</td><td>${p.cut}</td>
+        <td><span class="clickable-product" onclick="openProductDetailModal(${p.id})"><b>${p.name}</b> 🔍입고히스토리</span></td>
+        <td>₱${fmt(p.buy_price_100g)} / ₱${fmt(p.buy_price_kg)}</td>
+        <td>₱ ${fmt(p.adjusted_price)}</td><td>₱ ${fmt(p.sale_per_kg)}</td>
+        <td>${fmtKg(p.slab_stock_kg)}</td><td>${fmtKg(p.pack_stock_kg)}</td><td>${p.pack_count}</td>
+        <td><b>${fmtKg(tot)}</b></td><td>7.0 kg</td><td>₱ ${fmt(val)}</td>
+        <td><button class="btn" onclick='editProduct(${JSON.stringify(p)})'>수정</button></td>
+      </tr>`;
+    }).join('');
+}
+
+function filterProdPart(part, btn) {
+  prodPartFilter = part;
+  btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderProducts();
+}
+
+function renderReceivingCalendar() {
+  const ym = document.getElementById('rec-cal-month').value || getLocalToday().slice(0, 7);
+  document.getElementById('rec-cal-month').value = ym;
+  const [y, m] = ym.split('-').map(Number);
+  const days = new Date(y, m, 0).getDate();
+  const recDates = new Set(STATE.movements.filter(m => m.type === 'product_receiving' || m.type === 'carryover_inbound').map(m => (m.date || '').slice(0, 10)));
+
+  let html = '';
+  for (let d = 1; d <= days; d++) {
+    const dt = `${ym}-${String(d).padStart(2, '0')}`;
+    const has = recDates.has(dt);
+    const sel = selectedRecCalDate === dt;
+    html += `<div class="cal-cell ${has ? 'has-in' : ''} ${sel ? 'selected' : ''}" onclick="selectedRecCalDate='${dt}';renderReceivingCalendar();renderReceivingTable();">
+      ${d}일 ${has ? '✔' : ''}
+    </div>`;
+  }
+  document.getElementById('receiving-calendar').innerHTML = html;
+}
+
+function renderReceivingTable() {
+  const recMovs = STATE.movements.filter(m => m.type === 'product_receiving' || m.type === 'carryover_inbound');
+  const list = selectedRecCalDate ? recMovs.filter(m => (m.date || '').slice(0, 10) === selectedRecCalDate) : recMovs;
+  const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+
+  document.getElementById('receiving-table-body').innerHTML = list.map(m => {
+    const isCarry = m.type === 'carryover_inbound';
+    const isSlab = (m.slab_kg_delta || 0) > 0 && (m.pack_kg_delta || 0) <= 0;
+    const netKg = Number(m.kg_delta || 0);
+    const unitPrice = Number(m.unit_price || 0);
+    const totalAmt = Number(m.amount || (netKg * unitPrice));
+
+    return `<tr class="clickable-row" onclick='editReceiveMovement(${JSON.stringify(m)})'>
+      <td>${m.date}</td>
+      <td>${isCarry ? '<span class="badge carry">전월이월</span>' : '<span class="badge ok">상품입고</span>'}</td>
+      <td>${isSlab ? '슬랍재고' : '팩재고'}</td>
+      <td><b>${prodMap[m.product_id] || '-'}</b></td>
+      <td>${m.qty} 팩</td>
+      <td><b>${fmtKg(netKg)} KG</b></td>
+      <td><b style="color:#166534;">${fmtKg(netKg)} KG</b></td>
+      <td>₱ ${fmt(unitPrice)}</td>
+      <td><b>₱ ${fmt(totalAmt)}</b></td>
+      <td>${m.note}</td>
+      <td onclick="event.stopPropagation();">
+        <button class="btn" onclick='editReceiveMovement(${JSON.stringify(m)})'>수정</button>
+        <button class="btn warn" onclick="deleteMovement(${m.id})">삭제</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function editReceiveMovement(m) {
+  showTab('products', document.querySelectorAll('aside .nav')[1]);
+  document.getElementById('edit-rec-id').value = m.id;
+  document.getElementById('rec-date').value = (m.date || '').slice(0, 10);
+  const prod = STATE.products.find(p => p.id === m.product_id);
+  if (prod) {
+    document.getElementById('rec-meat').value = prod.category;
+    updateReceiveProductOptions();
+  }
+  document.getElementById('rec-prod').value = m.product_id;
+  const isSlab = (m.slab_kg_delta || 0) > 0 && (m.pack_kg_delta || 0) <= 0;
+  document.getElementById('rec-target').value = isSlab ? 'slab' : 'pack';
+  document.getElementById('rec-buy100').value = m.unit_price ? (m.unit_price / 10).toFixed(2) : '';
+  const netKg = Number(m.kg_delta || 0);
+  document.getElementById('rec-kg').value = netKg.toFixed(3);
+  document.getElementById('rec-packs').value = m.qty || 0;
+  document.getElementById('rec-carryover').checked = (m.type === 'carryover_inbound');
+
+  document.getElementById('btn-rec-submit').textContent = '수정 반영 저장';
+  document.getElementById('btn-rec-cancel').style.display = 'inline-block';
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function resetReceiveForm() {
+  document.getElementById('edit-rec-id').value = '';
+  document.getElementById('rec-date').value = getLocalToday();
+  document.getElementById('rec-target').value = 'pack';
+  document.getElementById('rec-buy100').value = '';
+  document.getElementById('rec-kg').value = '';
+  document.getElementById('rec-packs').value = '';
+  document.getElementById('rec-carryover').checked = false;
+  document.getElementById('btn-rec-submit').textContent = '입고 등록 실행';
+  document.getElementById('btn-rec-cancel').style.display = 'none';
+}
+
+function editProduct(p) {
+  document.getElementById('edit-prod-id').value = p.id;
+  document.getElementById('prod-cat').value = p.category;
+  updateCatalogCuts();
+  document.getElementById('prod-cut').value = p.cut;
+  document.getElementById('prod-name').value = p.name;
+  document.getElementById('prod-barcode').value = p.barcode || '';
+  document.getElementById('prod-buy100').value = p.buy_price_100g;
+  document.getElementById('prod-adj').value = p.adjusted_price;
+  document.getElementById('prod-sale').value = p.sale_per_kg;
+  document.getElementById('prod-slab-kg').value = p.slab_stock_kg;
+  document.getElementById('prod-pack-kg').value = p.pack_stock_kg;
+  document.getElementById('prod-pack-cnt').value = p.pack_count;
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function resetProdForm() {
+  document.getElementById('edit-prod-id').value = '';
+  document.getElementById('prod-name').value = '';
+  document.getElementById('prod-barcode').value = '';
+  document.getElementById('prod-buy100').value = '';
+  document.getElementById('prod-adj').value = '';
+  document.getElementById('prod-sale').value = '';
+  document.getElementById('prod-slab-kg').value = '';
+  document.getElementById('prod-pack-kg').value = '';
+  document.getElementById('prod-pack-cnt').value = '';
+}
+
+async function saveProduct() {
+  const payload = {
+    id: document.getElementById('edit-prod-id').value || null,
+    category: document.getElementById('prod-cat').value,
+    cut: document.getElementById('prod-cut').value,
+    name: document.getElementById('prod-name').value,
+    barcode: document.getElementById('prod-barcode').value,
+    buy_price_100g: document.getElementById('prod-buy100').value,
+    adjusted_price: document.getElementById('prod-adj').value,
+    sale_per_kg: document.getElementById('prod-sale').value,
+    slab_stock_kg: document.getElementById('prod-slab-kg').value,
+    pack_stock_kg: document.getElementById('prod-pack-kg').value,
+    pack_count: document.getElementById('prod-pack-cnt').value,
+    min_stock_kg: 7.0
+  };
+  const res = await fetch('/api/products/save', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('상품 카탈로그/재고가 저장되었습니다 (안전재고 7kg 적용).');
+  resetProdForm();
+  await loadState();
+}
+
+async function submitProductReceive() {
+  const editId = document.getElementById('edit-rec-id').value;
+  const endpoint = editId ? '/api/products/receive/update' : '/api/products/receive';
+  const payload = {
+    id: editId || null,
+    date: document.getElementById('rec-date').value,
+    product_id: document.getElementById('rec-prod').value,
+    target_type: document.getElementById('rec-target').value,
+    buy_price_100g: document.getElementById('rec-buy100').value,
+    kg: document.getElementById('rec-kg').value,
+    packs: document.getElementById('rec-packs').value,
+    is_carryover: document.getElementById('rec-carryover').checked
+  };
+  const res = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast(editId ? '상품 입고 내역이 수정되고 재고가 재계산되었습니다.' : (payload.is_carryover ? '전월 이월 재고가 반영되었습니다 (구매KG 제외).' : '상품 입고가 반영되었습니다.'));
+  resetReceiveForm();
+  await loadState();
+}
+
+function showSlabSubTab(mode, btn) {
+  ['inbound', 'production', 'trim', 'waste'].forEach(m => {
+    document.getElementById('slab-subtab-' + m).style.display = (m === mode) ? 'block' : 'none';
+  });
+  btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+function toggleSlabCarryoverMode() {
+  const isCarry = document.getElementById('slab-carryover').checked;
+  if (isCarry) {
+    document.getElementById('slab-date').value = getPrevMonthLastDay();
+  } else {
+    document.getElementById('slab-date').value = getLocalToday();
+  }
+}
+
+function renderSlabSection() {
+  const totalSlabKg = STATE.slabs.reduce((a, b) => a + (b.remaining_kg || 0), 0);
+  const openCount = STATE.slabs.filter(s => s.remaining_kg > 0.0001).length;
+  const totalTrim = STATE.movements.reduce((a, b) => a + (b.trim_kg || 0), 0);
+  const totalWaste = STATE.movements.reduce((a, b) => a + (b.waste_kg || 0), 0);
+
+  document.getElementById('slab-summary-cards').innerHTML = `
+    <div class="card" onclick="openSlabSummaryModal('total_kg')"><small>현재 슬랍 총 잔여 KG (클릭시 상세)</small><strong>${fmtKg(totalSlabKg)} KG</strong></div>
+    <div class="card" onclick="openSlabSummaryModal('count')"><small>보유 슬랍 개수 (클릭시 상세)</small><strong>${openCount} 개</strong></div>
+    <div class="card" onclick="openSlabSummaryModal('trim')"><small>누적 트림 KG (클릭시 상세)</small><strong>${fmtKg(totalTrim)} KG</strong></div>
+    <div class="card" onclick="openSlabSummaryModal('loss')"><small>누적 폐기 KG (클릭시 상세)</small><strong>${fmtKg(totalWaste)} KG</strong></div>
+  `;
+
+  updateSlabProductSelect();
+  filterSlabSelectByMeat();
+  filterTrimSlabByMeat();
+  updateProductionProductOptions();
+  updateWasteProducts();
+
+  renderCalendar();
+  renderSlabTable();
+  renderProductionCalendar();
+  renderProductionTable();
+  renderTrimCalendar();
+  renderTrimTable();
+  renderWasteCalendar();
+  renderWasteTable();
+}
+
+function updateSlabProductSelect() {
+  const meat = document.getElementById('slab-meat').value;
+  const matched = STATE.products.filter(p => p.category === meat);
+  document.getElementById('slab-product-id').innerHTML = '<option value="">연관 상품 선택</option>' +
+    matched.map(p => `<option value="${p.id}">[${p.category}] ${p.name}</option>`).join('');
+}
+
+function filterSlabSelectByMeat(forceSlabId = null) {
+  const meatFilter = document.getElementById('prod-filter-meat').value;
+  const openSlabs = STATE.slabs.filter(s => (s.remaining_kg != 0 || (forceSlabId && String(s.id) === String(forceSlabId))) && (meatFilter === '전체' || s.meat_type === meatFilter));
+  const slabOpts = openSlabs.map(s => `<option value="${s.id}">[${s.date}${s.is_carryover ? '·전월이월' : ''}] ${s.meat_type} · ${s.cut} · #${s.slab_no || s.id} (잔량 ${fmtKg(s.remaining_kg)}kg)</option>`).join('');
+  document.getElementById('prod-slab-select').innerHTML = slabOpts || '<option value="">보유중인 슬랍 없음</option>';
+  if (forceSlabId) document.getElementById('prod-slab-select').value = forceSlabId;
+}
+
+function updateProductionProductOptions() {
+  const meatFilter = document.getElementById('prod-filter-meat').value;
+  const matchedProducts = STATE.products.filter(p => meatFilter === '전체' || p.category === meatFilter);
+  const prodOpts = matchedProducts.map(p => `<option value="${p.id}">[${p.category}] ${p.name}</option>`).join('');
+  document.getElementById('prod-out-product').innerHTML = prodOpts || '<option value="">해당 육종 상품 없음</option>';
+}
+
+function filterTrimSlabByMeat(forceSlabId = null) {
+  const meatFilter = document.getElementById('trim-filter-meat').value;
+  const openSlabs = STATE.slabs.filter(s => (s.remaining_kg != 0 || (forceSlabId && String(s.id) === String(forceSlabId))) && (meatFilter === '전체' || s.meat_type === meatFilter));
+  const slabOpts = openSlabs.map(s => `<option value="${s.id}">[${s.date}${s.is_carryover ? '·전월이월' : ''}] ${s.meat_type} · ${s.cut} · #${s.slab_no || s.id} (잔량 ${fmtKg(s.remaining_kg)}kg)</option>`).join('');
+  document.getElementById('trim-slab-select').innerHTML = slabOpts || '<option value="">보유중인 슬랍 없음</option>';
+  if (forceSlabId) document.getElementById('trim-slab-select').value = forceSlabId;
+}
+
+function updateWasteProducts() {
+  const meat = document.getElementById('waste-meat').value;
+  const list = STATE.products.filter(p => p.category === meat);
+  document.getElementById('waste-prod').innerHTML = list.map(p =>
+    `<option value="${p.id}">${p.name} (팩:${fmtKg(p.pack_stock_kg)}kg / 슬랍:${fmtKg(p.slab_stock_kg)}kg)</option>`
+  ).join('');
+}
+
+function calcProdUnitKg() {
+  const inKg = parseFloat(document.getElementById('prod-in-kg').value) || 0;
+  const packs = parseInt(document.getElementById('prod-pack-qty').value) || 0;
+  const unitEl = document.getElementById('prod-pack-unit');
+  if (inKg > 0 && packs > 0) {
+    unitEl.value = (inKg / packs).toFixed(3);
+  } else {
+    unitEl.value = '';
+  }
+}
+
+function renderCalendar() {
+  const ym = document.getElementById('cal-month').value || getLocalToday().slice(0, 7);
+  document.getElementById('cal-month').value = ym;
+  const [y, m] = ym.split('-').map(Number);
+  const days = new Date(y, m, 0).getDate();
+  const inboundDates = new Set(STATE.slabs.map(s => s.date));
+
+  let html = '';
+  for (let d = 1; d <= days; d++) {
+    const dt = `${ym}-${String(d).padStart(2, '0')}`;
+    const has = inboundDates.has(dt);
+    const sel = selectedCalDate === dt;
+    html += `<div class="cal-cell ${has ? 'has-in' : ''} ${sel ? 'selected' : ''}" onclick="selectedCalDate='${dt}';renderCalendar();renderSlabTable();">
+      ${d}일 ${has ? '✔' : ''}
+    </div>`;
+  }
+  document.getElementById('slab-calendar').innerHTML = html;
+}
+
+function renderProductionCalendar() {
+  const ym = document.getElementById('prod-cal-month').value || getLocalToday().slice(0, 7);
+  document.getElementById('prod-cal-month').value = ym;
+  const [y, m] = ym.split('-').map(Number);
+  const days = new Date(y, m, 0).getDate();
+  const prodDates = new Set(STATE.movements.filter(m => m.type === 'slab_production').map(m => (m.date || '').slice(0, 10)));
+
+  let html = '';
+  for (let d = 1; d <= days; d++) {
+    const dt = `${ym}-${String(d).padStart(2, '0')}`;
+    const has = prodDates.has(dt);
+    const sel = selectedProdCalDate === dt;
+    html += `<div class="cal-cell ${has ? 'has-sale' : ''} ${sel ? 'selected' : ''}" onclick="selectedProdCalDate='${dt}';renderProductionCalendar();renderProductionTable();">
+      ${d}일 ${has ? '✔' : ''}
+    </div>`;
+  }
+  document.getElementById('production-calendar').innerHTML = html;
+}
+
+function renderTrimCalendar() {
+  const ym = document.getElementById('trim-cal-month').value || getLocalToday().slice(0, 7);
+  document.getElementById('trim-cal-month').value = ym;
+  const [y, m] = ym.split('-').map(Number);
+  const days = new Date(y, m, 0).getDate();
+  const trimDates = new Set(STATE.movements.filter(m => m.type === 'trim').map(m => (m.date || '').slice(0, 10)));
+
+  let html = '';
+  for (let d = 1; d <= days; d++) {
+    const dt = `${ym}-${String(d).padStart(2, '0')}`;
+    const has = trimDates.has(dt);
+    const sel = selectedTrimCalDate === dt;
+    html += `<div class="cal-cell ${has ? 'has-warn' : ''} ${sel ? 'selected' : ''}" onclick="selectedTrimCalDate='${dt}';renderTrimCalendar();renderTrimTable();">
+      ${d}일 ${has ? '✔' : ''}
+    </div>`;
+  }
+  document.getElementById('trim-calendar').innerHTML = html;
+}
+
+function renderWasteCalendar() {
+  const ym = document.getElementById('waste-cal-month').value || getLocalToday().slice(0, 7);
+  document.getElementById('waste-cal-month').value = ym;
+  const [y, m] = ym.split('-').map(Number);
+  const days = new Date(y, m, 0).getDate();
+  const wasteDates = new Set(STATE.movements.filter(m => m.type === 'waste').map(m => (m.date || '').slice(0, 10)));
+
+  let html = '';
+  for (let d = 1; d <= days; d++) {
+    const dt = `${ym}-${String(d).padStart(2, '0')}`;
+    const has = wasteDates.has(dt);
+    const sel = selectedWasteCalDate === dt;
+    html += `<div class="cal-cell ${has ? 'has-in' : ''} ${sel ? 'selected' : ''}" onclick="selectedWasteCalDate='${dt}';renderWasteCalendar();renderWasteTable();">
+      ${d}일 ${has ? '✔' : ''}
+    </div>`;
+  }
+  document.getElementById('waste-calendar').innerHTML = html;
+}
+
+function renderSlabTable() {
+  const todayStr = getLocalToday();
+  const meatFilter = document.getElementById('slab-table-meat-filter').value;
+  let list = selectedCalDate ? STATE.slabs.filter(s => s.date === selectedCalDate) : STATE.slabs;
+  if (meatFilter !== '전체') {
+    list = list.filter(s => s.meat_type === meatFilter);
+  }
+  const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+
+  document.getElementById('slab-table-body').innerHTML = list.map(s => {
+    const isZero = s.remaining_kg <= 0.0001;
+    const isNegative = s.remaining_kg < 0;
+    const isCarry = Number(s.is_carryover) === 1;
+    const isOtherDate = s.date !== todayStr;
+    const cls = isNegative ? 'zero-kg' : (isZero ? 'zero-kg' : (isCarry ? 'carryover-row' : (isOtherDate ? 'other-date' : '')));
+    const pName = prodMap[s.product_id] || '-';
+    return `<tr class="clickable-row ${cls}" onclick='editSlab(${JSON.stringify(s)})'>
+      <td>${s.date}</td>
+      <td>${isCarry ? '<span class="badge carry">전월이월</span>' : '<span class="badge ok">당월입고</span>'}</td>
+      <td>${s.meat_type}</td><td>${s.cut}</td><td><b>${pName}</b></td><td><b>${s.slab_no || '-'}</b></td>
+      <td>${fmtKg(s.kg)}</td><td><b>${fmtKg(s.remaining_kg)}</b></td><td>₱ ${fmt(s.buy_price_kg)}</td>
+      <td>${isNegative ? '음수초과' : (isZero ? '소진(0KG)' : '보유중')}</td>
+      <td onclick="event.stopPropagation();">
+        <button class="btn" onclick='editSlab(${JSON.stringify(s)})'>수정</button>
+        <button class="btn warn" onclick='deleteSlab(${s.id})'>삭제</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function renderProductionTable() {
+  const prodMovs = STATE.movements.filter(m => m.type === 'slab_production');
+  const list = selectedProdCalDate ? prodMovs.filter(m => (m.date || '').slice(0, 10) === selectedProdCalDate) : prodMovs;
+  const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+  const slabMap = Object.fromEntries(STATE.slabs.map(s => [s.id, s]));
+
+  document.getElementById('production-table-body').innerHTML = list.map(m => {
+    const slab = slabMap[m.slab_id] || {};
+    const inputKg = Math.abs(m.slab_kg_delta || 0);
+    const outKg = Math.abs(m.pack_kg_delta || m.kg_delta || 0);
+    const packs = Math.abs(m.pack_delta || m.qty || 0);
+    const unitKg = packs > 0 ? (inputKg / packs) : 0;
+    const prodName = prodMap[m.product_id] || '-';
+    return `<tr class="clickable-row" onclick='editProduction(${JSON.stringify(m)})'>
+      <td>${m.date}</td>
+      <td>${m.meat_type}</td>
+      <td>#${slab.slab_no || m.slab_id} (${slab.cut || ''})</td>
+      <td><b>${prodName}</b></td>
+      <td>${fmtKg(inputKg)} KG</td>
+      <td>${packs} 팩</td>
+      <td><b style="color:#166534;">${fmtKg(unitKg)} KG/팩</b></td>
+      <td><b>${fmtKg(outKg)} KG</b></td>
+      <td onclick="event.stopPropagation();">
+        <button class="btn" onclick='editProduction(${JSON.stringify(m)})'>수정</button>
+        <button class="btn warn" onclick="deleteMovement(${m.id})">삭제</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function renderTrimTable() {
+  const trimMovs = STATE.movements.filter(m => m.type === 'trim');
+  const list = selectedTrimCalDate ? trimMovs.filter(m => (m.date || '').slice(0, 10) === selectedTrimCalDate) : trimMovs;
+  const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+  const slabMap = Object.fromEntries(STATE.slabs.map(s => [s.id, s]));
+
+  document.getElementById('trim-table-body').innerHTML = list.map(m => {
+    const slab = slabMap[m.slab_id] || {};
+    const trimKg = Math.abs(m.trim_kg || m.slab_kg_delta || 0);
+    return `<tr class="clickable-row" onclick='editTrimMovement(${JSON.stringify(m)})'>
+      <td>${m.date}</td>
+      <td>${m.meat_type}</td>
+      <td>#${slab.slab_no || m.slab_id} (${slab.cut || ''})</td>
+      <td>${prodMap[m.product_id] || '-'}</td>
+      <td><b>${fmtKg(trimKg)} KG</b></td>
+      <td>₱ ${fmt(m.amount)}</td>
+      <td>${m.note}</td>
+      <td onclick="event.stopPropagation();">
+        <button class="btn" onclick='editTrimMovement(${JSON.stringify(m)})'>수정</button>
+        <button class="btn warn" onclick="deleteMovement(${m.id})">삭제</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function editTrimMovement(m) {
+  showSlabSubTab('trim', document.querySelectorAll('#tab-slabs .subtabs button')[2]);
+  document.getElementById('edit-trim-id').value = m.id;
+  document.getElementById('trim-date').value = (m.date || '').slice(0, 10);
+  document.getElementById('trim-filter-meat').value = '전체';
+  filterTrimSlabByMeat(m.slab_id);
+  document.getElementById('trim-prod-select').value = m.product_id || '';
+  document.getElementById('trim-kg').value = Math.abs(m.trim_kg || m.slab_kg_delta || 0);
+  document.getElementById('trim-note').value = m.note || '';
+
+  document.getElementById('btn-trim-submit').textContent = '트림 수정 저장';
+  document.getElementById('btn-trim-cancel').style.display = 'inline-block';
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function resetTrimForm() {
+  document.getElementById('edit-trim-id').value = '';
+  document.getElementById('trim-date').value = getLocalToday();
+  document.getElementById('trim-filter-meat').value = '전체';
+  filterTrimSlabByMeat();
+  document.getElementById('trim-prod-select').value = '';
+  document.getElementById('trim-kg').value = '';
+  document.getElementById('trim-note').value = '';
+  document.getElementById('btn-trim-submit').textContent = '트림 등록';
+  document.getElementById('btn-trim-cancel').style.display = 'none';
+}
+
+function renderWasteTable() {
+  const wasteMovs = STATE.movements.filter(m => m.type === 'waste');
+  const list = selectedWasteCalDate ? wasteMovs.filter(m => (m.date || '').slice(0, 10) === selectedWasteCalDate) : wasteMovs;
+  const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+
+  document.getElementById('waste-table-body').innerHTML = list.map(m => {
+    const isSlab = Math.abs(m.slab_kg_delta || 0) > 0 && Math.abs(m.pack_kg_delta || 0) === 0;
+    const wasteKg = Math.abs(m.waste_kg || m.kg_delta || 0);
+    const wastePacks = Math.abs(m.pack_delta || m.qty || 0);
+    return `<tr class="clickable-row" onclick='editWasteMovement(${JSON.stringify(m)})'>
+      <td>${m.date}</td>
+      <td>${m.meat_type}</td>
+      <td><b>${prodMap[m.product_id] || '-'}</b></td>
+      <td>${isSlab ? '슬랍재고' : '팩재고'}</td>
+      <td><b>${fmtKg(wasteKg)} KG</b></td>
+      <td>${wastePacks} 팩</td>
+      <td>₱ ${fmt(m.amount)}</td>
+      <td>${m.note}</td>
+      <td onclick="event.stopPropagation();">
+        <button class="btn" onclick='editWasteMovement(${JSON.stringify(m)})'>수정</button>
+        <button class="btn warn" onclick="deleteMovement(${m.id})">삭제</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function editWasteMovement(m) {
+  showSlabSubTab('waste', document.querySelectorAll('#tab-slabs .subtabs button')[3]);
+  document.getElementById('edit-waste-id').value = m.id;
+  document.getElementById('waste-date').value = (m.date || '').slice(0, 10);
+  document.getElementById('waste-meat').value = m.meat_type || '돼지고기';
+  updateWasteProducts();
+  document.getElementById('waste-prod').value = m.product_id;
+  const isSlab = Math.abs(m.slab_kg_delta || 0) > 0 && Math.abs(m.pack_kg_delta || 0) === 0;
+  document.getElementById('waste-source').value = isSlab ? 'slab' : 'pack';
+  document.getElementById('waste-kg').value = Math.abs(m.waste_kg || m.kg_delta || 0);
+  document.getElementById('waste-packs').value = Math.abs(m.pack_delta || m.qty || 0);
+  document.getElementById('waste-note').value = m.note || '';
+
+  document.getElementById('btn-waste-submit').textContent = '폐기 수정 저장';
+  document.getElementById('btn-waste-cancel').style.display = 'inline-block';
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function resetWasteForm() {
+  document.getElementById('edit-waste-id').value = '';
+  document.getElementById('waste-date').value = getLocalToday();
+  document.getElementById('waste-source').value = 'pack';
+  document.getElementById('waste-kg').value = '';
+  document.getElementById('waste-packs').value = '';
+  document.getElementById('waste-note').value = '';
+  document.getElementById('btn-waste-submit').textContent = '폐기 등록 및 재고 차감';
+  document.getElementById('btn-waste-cancel').style.display = 'none';
+}
+
+function showSlabHistory(slabId) {
+  const s = STATE.slabs.find(x => x.id === slabId);
+  const movs = STATE.movements.filter(m => m.slab_id === slabId);
+  const box = document.getElementById('slab-history-box');
+  box.innerHTML = `<b>[슬랍 #${s.slab_no || s.id} · ${s.meat_type} ${s.cut}] 입출고·생산 히스토리 (최초 ${fmtKg(s.kg)}kg / 잔량 ${fmtKg(s.remaining_kg)}kg)</b>
+    <ul style="margin:6px 0 0 18px;font-size:12.5px;">
+      ${movs.length ? movs.map(m => `<li>[${m.date}] ${m.note} (변동: ${fmtKg(m.slab_kg_delta)}kg)</li>`).join('') : '<li>기록 없음</li>'}
+    </ul>`;
+}
+
+function editSlab(s) {
+  showTab('slabs', document.querySelectorAll('aside .nav')[2]);
+  showSlabSubTab('inbound', document.querySelectorAll('#tab-slabs .subtabs button')[0]);
+  document.getElementById('edit-slab-id').value = s.id;
+  document.getElementById('slab-date').value = s.date;
+  document.getElementById('slab-meat').value = s.meat_type;
+  updateSlabProductSelect();
+  document.getElementById('slab-cut').value = s.cut;
+  document.getElementById('slab-product-id').value = s.product_id || '';
+  document.getElementById('slab-no').value = s.slab_no;
+  document.getElementById('slab-kg').value = s.kg;
+  document.getElementById('slab-buy100').value = s.buy_price_100g;
+  document.getElementById('slab-carryover').checked = Number(s.is_carryover) === 1;
+  showSlabHistory(s.id);
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function resetSlabForm() {
+  document.getElementById('edit-slab-id').value = '';
+  document.getElementById('slab-cut').value = '';
+  document.getElementById('slab-no').value = '';
+  document.getElementById('slab-kg').value = '';
+  document.getElementById('slab-buy100').value = '';
+  document.getElementById('slab-product-id').value = '';
+  document.getElementById('slab-carryover').checked = false;
+  document.getElementById('slab-date').value = getLocalToday();
+  document.getElementById('slab-history-box').innerHTML = '<b>슬랍 행을 클릭하면 해당 슬랍의 생산·트림 히스토리가 표시됩니다.</b>';
+}
+
+async function saveSlab() {
+  const payload = {
+    id: document.getElementById('edit-slab-id').value || null,
+    date: document.getElementById('slab-date').value,
+    meat_type: document.getElementById('slab-meat').value,
+    cut: document.getElementById('slab-cut').value,
+    product_id: document.getElementById('slab-product-id').value || null,
+    slab_no: document.getElementById('slab-no').value,
+    kg: document.getElementById('slab-kg').value,
+    buy_price_100g: document.getElementById('slab-buy100').value,
+    is_carryover: document.getElementById('slab-carryover').checked
+  };
+  const res = await fetch('/api/slabs/receive', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast(payload.is_carryover ? '전월 이월 슬랍이 저장되었습니다 (현재고 합산 완료).' : '슬랍 입고 정보가 저장되었습니다.');
+  resetSlabForm();
+  await loadState();
+}
+
+async function deleteSlab(slabId) {
+  if (!confirm('정말 이 슬랍 원물을 삭제하시겠습니까? 관련 이력 및 현재고가 정확히 원복됩니다.')) return;
+  const res = await fetch('/api/slabs/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: slabId})});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('슬랍이 삭제되고 재고가 원복되었습니다.');
+  await loadState();
+}
+
+function editProduction(m) {
+  showTab('slabs', document.querySelectorAll('aside .nav')[2]);
+  showSlabSubTab('production', document.querySelectorAll('#tab-slabs .subtabs button')[1]);
+  document.getElementById('edit-prod-run-id').value = m.id;
+  document.getElementById('prod-run-date').value = m.date;
+  document.getElementById('prod-filter-meat').value = m.meat_type || '돼지고기';
+  updateProductionProductOptions();
+  filterSlabSelectByMeat(m.slab_id);
+  document.getElementById('prod-out-product').value = m.product_id;
+  const inKg = Math.abs(m.slab_kg_delta || 0);
+  const packs = Math.abs(m.pack_delta || m.qty || 0);
+  document.getElementById('prod-in-kg').value = inKg;
+  document.getElementById('prod-pack-qty').value = packs;
+  calcProdUnitKg();
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function resetProductionForm() {
+  document.getElementById('edit-prod-run-id').value = '';
+  document.getElementById('prod-in-kg').value = '';
+  document.getElementById('prod-pack-unit').value = '';
+  document.getElementById('prod-pack-qty').value = '';
+  document.getElementById('prod-run-date').value = getLocalToday();
+  filterSlabSelectByMeat();
+  updateProductionProductOptions();
+}
+
+async function submitProduction() {
+  const editId = document.getElementById('edit-prod-run-id').value;
+  const endpoint = editId ? '/api/slabs/production/update' : '/api/slabs/production';
+  const payload = {
+    id: editId || null,
+    date: document.getElementById('prod-run-date').value,
+    slab_id: document.getElementById('prod-slab-select').value,
+    product_id: document.getElementById('prod-out-product').value,
+    input_kg: document.getElementById('prod-in-kg').value,
+    pack_unit_kg: document.getElementById('prod-pack-unit').value,
+    packs: document.getElementById('prod-pack-qty').value
+  };
+  const res = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('생산 반영 및 재고 업데이트가 완료되었습니다.');
+  resetProductionForm();
+  await loadState();
+}
+
+async function submitTrim() {
+  const editId = document.getElementById('edit-trim-id').value;
+  const endpoint = editId ? '/api/slabs/trim/update' : '/api/slabs/trim';
+  const payload = {
+    id: editId || null,
+    date: document.getElementById('trim-date').value,
+    slab_id: document.getElementById('trim-slab-select').value,
+    product_id: document.getElementById('trim-prod-select').value,
+    trim_kg: document.getElementById('trim-kg').value,
+    note: document.getElementById('trim-note').value
+  };
+  const res = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast(editId ? '트림 내역이 수정되고 슬랍 잔량이 재계산되었습니다.' : '트림 등록 및 손실 합산이 완료되었습니다.');
+  resetTrimForm();
+  await loadState();
+}
+
+async function submitWaste() {
+  const editId = document.getElementById('edit-waste-id').value;
+  const endpoint = editId ? '/api/waste/update' : '/api/waste';
+  const payload = {
+    id: editId || null,
+    date: document.getElementById('waste-date').value,
+    meat_type: document.getElementById('waste-meat').value,
+    product_id: document.getElementById('waste-prod').value,
+    stock_source: document.getElementById('waste-source').value,
+    waste_kg: document.getElementById('waste-kg').value,
+    waste_packs: document.getElementById('waste-packs').value,
+    note: document.getElementById('waste-note').value
+  };
+  const res = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast(editId ? '폐기 내역이 수정되고 재고가 재계산되었습니다.' : '폐기 등록 및 선택 재고 차감이 완료되었습니다.');
+  resetWasteForm();
+  await loadState();
+}
+
+function syncSalesMonthFromDate() {
+  const dt = document.getElementById('sales-cal-date').value;
+  if (dt) {
+    document.getElementById('sales-cal-month').value = dt.slice(0, 7);
+    renderSalesCalendar();
+  }
+}
+
+let selectedSalesImportId = null;
+
+function selectSalesDateFromCal(dt) {
+  document.getElementById('sales-cal-date').value = dt;
+  renderSalesCalendar();
+  const matchedImport = (STATE.sales_imports || []).find(s => s.deduct_date === dt || s.sheet_date === dt);
+  if (matchedImport) {
+    openSalesDetail(matchedImport.id);
+  }
+}
+
+function renderSalesCalendar() {
+  const ym = document.getElementById('sales-cal-month').value || getLocalToday().slice(0, 7);
+  document.getElementById('sales-cal-month').value = ym;
+  const [y, m] = ym.split('-').map(Number);
+  const days = new Date(y, m, 0).getDate();
+
+  const registeredDates = new Set();
+  (STATE.sales_imports || []).forEach(s => {
+    if (s.deduct_date) registeredDates.add(s.deduct_date);
+    if (s.sheet_date) registeredDates.add(s.sheet_date);
+  });
+  STATE.movements.filter(m => m.type === 'sale').forEach(m => {
+    if (m.date) registeredDates.add(m.date.slice(0, 10));
+  });
+
+  const selectedDate = document.getElementById('sales-cal-date').value;
+  let html = '';
+  for (let d = 1; d <= days; d++) {
+    const dt = `${ym}-${String(d).padStart(2, '0')}`;
+    const has = registeredDates.has(dt);
+    const sel = selectedDate === dt;
+    html += `<div class="cal-cell ${has ? 'has-sale' : ''} ${sel ? 'selected' : ''}" onclick="selectSalesDateFromCal('${dt}')">
+      ${d}일 ${has ? '✔' : ''}
+    </div>`;
+  }
+  document.getElementById('sales-calendar').innerHTML = html;
+}
+
+function renderSalesPreviewRows() {
+  if (!salesPreviewData) return;
+  const prodOpts = '<option value="">-- 미매칭 (선택안함) --</option>' +
+    STATE.products.map(p => `<option value="${p.id}">[${p.category}] ${p.name}</option>`).join('');
+
+  document.getElementById('sales-preview-body').innerHTML = salesPreviewData.rows.map((r, idx) => `
+    <tr>
+      <td>${r.row_no}</td>
+      <td>${r.raw_name}</td>
+      <td>
+        <select onchange="updatePreviewRowProd(${idx}, this.value)">
+          ${prodOpts.replace(`value="${r.product_id}"`, `value="${r.product_id}" selected`)}
+        </select>
+      </td>
+      <td><input type="number" value="${r.qty}" style="width:70px;" onchange="salesPreviewData.rows[${idx}].qty=Number(this.value)"></td>
+      <td><input type="number" step="0.001" value="${r.kg}" style="width:85px;" onchange="salesPreviewData.rows[${idx}].kg=Number(this.value)"></td>
+      <td><input type="number" step="0.01" value="${r.amount}" style="width:95px;" onchange="salesPreviewData.rows[${idx}].amount=Number(this.value)"></td>
+      <td>₱ ${fmt(r.price_per_kg)}</td>
+      <td><button class="btn warn" onclick="removePreviewRow(${idx})">제외</button></td>
+    </tr>
+  `).join('');
+}
+
+function updatePreviewRowProd(idx, pidVal) {
+  const pid = pidVal ? Number(pidVal) : null;
+  salesPreviewData.rows[idx].product_id = pid;
+  const p = STATE.products.find(x => x.id === pid);
+  if (p) {
+    salesPreviewData.rows[idx].product_name = p.name;
+    if (p.sale_per_kg > 0 && salesPreviewData.rows[idx].amount !== 0) {
+      salesPreviewData.rows[idx].kg = Number((salesPreviewData.rows[idx].amount / p.sale_per_kg).toFixed(3));
+      salesPreviewData.rows[idx].price_per_kg = p.sale_per_kg;
+    }
+  }
+  renderSalesPreviewRows();
+}
+
+function removePreviewRow(idx) {
+  salesPreviewData.rows.splice(idx, 1);
+  renderSalesPreviewRows();
+}
+
+async function previewSalesExcel() {
+  const fileInput = document.getElementById('sales-file');
+  if (!fileInput.files.length) return;
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  fd.append('selected_date', document.getElementById('sales-cal-date').value);
+
+  const res = await fetch('/api/sales/preview', {method: 'POST', body: fd});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+
+  salesPreviewData = data;
+  document.getElementById('sales-preview-box').style.display = 'block';
+  document.getElementById('sales-meta').innerHTML = `
+    파일: <b>${data.file_name}</b> | 인식 시트: <b>${data.target_sheet}</b> (판매일: ${data.sheet_date}) →
+    <span style="color:#dc2626;font-weight:bold;">실제 재고 차감 기준일(하루 전): ${data.deduct_date} (${data.deduct_mmdd})</span>
+    ${data.already_imported ? ' <span style="background:#fef08a;padding:2px 6px;border-radius:4px;">⚠ 이미 등록된 날짜입니다</span>' : ''}
+  `;
+  renderSalesPreviewRows();
+}
+
+async function applySalesExcel() {
+  if (!salesPreviewData) return;
+  const deductDate = salesPreviewData.deduct_date;
+  const res = await fetch('/api/sales/apply', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(salesPreviewData)});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+
+  document.getElementById('dash-target-date').value = deductDate;
+  document.getElementById('sales-cal-month').value = deductDate.slice(0, 7);
+  toast(`판매 엑셀 반영 완료! [${deductDate}] 달력 체크 및 재고 차감이 완료되었습니다.`);
+  document.getElementById('sales-preview-box').style.display = 'none';
+  document.getElementById('sales-file').value = '';
+  salesPreviewData = null;
+  await loadState();
+}
+
+async function undoLastSales() {
+  if (!STATE.sales_imports || !STATE.sales_imports.length) {
+    return alert('취소할 판매 엑셀 등록 내역이 없습니다.');
+  }
+  const latest = STATE.sales_imports[0];
+  await deleteSalesImport(latest.id);
+}
+
+async function deleteSalesImport(salesId) {
+  if (!confirm('이 판매 엑셀 등록 전체를 실행 취소(삭제)하시겠습니까? 차감되었던 재고가 즉시 원복되고 달력 체크가 해제됩니다.')) return;
+  const res = await fetch('/api/sales/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: salesId})});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  if (selectedSalesImportId === salesId) {
+    closeSalesDetail();
+  }
+  toast('판매 엑셀 실행이 취소되고 재고가 원복되었습니다.');
+  await loadState();
+}
+
+function renderSalesHistory() {
+  document.getElementById('sales-history-body').innerHTML = STATE.sales_imports.map(s => {
+    const isSel = selectedSalesImportId === s.id;
+    return `<tr class="clickable-row ${isSel ? 'carryover-row' : 'done-row'}" style="${isSel ? 'outline:2px solid #2563eb;' : ''}" onclick="openSalesDetail(${s.id})">
+      <td>${s.imported_at}</td>
+      <td><b>${s.file_name}</b></td>
+      <td><b>${s.sheet_name}</b> (${s.sheet_date})</td>
+      <td><b>${s.deduct_date}</b></td>
+      <td>${s.total_qty} 팩</td>
+      <td>${fmtKg(s.total_kg)} KG</td>
+      <td>₱ ${fmt(s.total_amount)}</td>
+      <td onclick="event.stopPropagation();">
+        <button class="btn primary" onclick="openSalesDetail(${s.id})">선택/상세수정</button>
+        <button class="btn warn" onclick="deleteSalesImport(${s.id})">전체삭제(원복)</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function openSalesDetail(salesId) {
+  selectedSalesImportId = salesId;
+  renderSalesHistory();
+  const res = await fetch(`/api/sales/detail/${salesId}?_t=${Date.now()}`, {cache: 'no-store'});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+
+  const info = data.import_info;
+  document.getElementById('sales-detail-panel').style.display = 'block';
+  document.getElementById('sales-detail-title').textContent =
+    `선택된 판매 실행 내역: [${info.file_name}] 시트 ${info.sheet_name} (재고차감일: ${info.deduct_date}) — 총 ${data.rows.length}건`;
+
+  const prodOpts = STATE.products.map(p => `<option value="${p.id}">[${p.category}] ${p.name}</option>`).join('');
+  document.getElementById('sales-add-prod').innerHTML = prodOpts;
+
+  const baseSelectOpts = '<option value="">-- 미매칭 --</option>' + prodOpts;
+  document.getElementById('sales-detail-body').innerHTML = data.rows.map(r => {
+    const selHtml = r.product_id
+      ? baseSelectOpts.replace(`value="${r.product_id}"`, `value="${r.product_id}" selected`)
+      : baseSelectOpts;
+    const saleKg = Number(-(r.kg_delta || 0));
+    const saleQty = Number(r.qty || 0);
+    return `<tr>
+      <td>#${r.id}</td>
+      <td><select id="srow-prod-${r.id}" style="min-width:190px;">${selHtml}</select></td>
+      <td><input type="number" id="srow-qty-${r.id}" value="${saleQty}" style="width:70px;"></td>
+      <td><input type="number" step="0.001" id="srow-kg-${r.id}" value="${saleKg.toFixed(3)}" style="width:85px;"></td>
+      <td><input type="number" step="0.01" id="srow-amt-${r.id}" value="${Number(r.amount || 0).toFixed(2)}" style="width:95px;"></td>
+      <td>₱ ${fmt(r.price_per_kg)}</td>
+      <td style="font-size:11.5px;color:#64748b;">${r.note || ''}</td>
+      <td>
+        <button class="btn primary" onclick="saveSalesDetailRow(${r.id})">수정저장</button>
+        <button class="btn warn" onclick="deleteSalesDetailRow(${r.id})">삭제</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('sales-detail-panel').scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+function closeSalesDetail() {
+  selectedSalesImportId = null;
+  document.getElementById('sales-detail-panel').style.display = 'none';
+  renderSalesHistory();
+}
+
+async function saveSalesDetailRow(movId) {
+  if (!selectedSalesImportId) return;
+  const payload = {
+    sales_id: selectedSalesImportId,
+    movement_id: movId,
+    product_id: document.getElementById(`srow-prod-${movId}`).value || null,
+    qty: document.getElementById(`srow-qty-${movId}`).value,
+    kg: document.getElementById(`srow-kg-${movId}`).value,
+    amount: document.getElementById(`srow-amt-${movId}`).value
+  };
+  const res = await fetch('/api/sales/row/update', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('판매 항목이 수정되었으며 재고가 자동 재계산되었습니다.');
+  await loadState();
+  await openSalesDetail(selectedSalesImportId);
+}
+
+async function deleteSalesDetailRow(movId) {
+  if (!selectedSalesImportId) return;
+  if (!confirm('이 판매 품목 1건을 삭제하시겠습니까? 차감된 재고가 즉시 원복됩니다.')) return;
+  const res = await fetch('/api/sales/row/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sales_id: selectedSalesImportId, movement_id: movId})
+  });
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('선택한 판매 항목이 삭제되고 재고가 원복되었습니다.');
+  await loadState();
+  await openSalesDetail(selectedSalesImportId);
+}
+
+async function addSalesDetailRow() {
+  if (!selectedSalesImportId) return;
+  const payload = {
+    sales_id: selectedSalesImportId,
+    product_id: document.getElementById('sales-add-prod').value,
+    qty: document.getElementById('sales-add-qty').value,
+    kg: document.getElementById('sales-add-kg').value,
+    amount: document.getElementById('sales-add-amt').value
+  };
+  const res = await fetch('/api/sales/row/add', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  document.getElementById('sales-add-qty').value = '';
+  document.getElementById('sales-add-kg').value = '';
+  document.getElementById('sales-add-amt').value = '';
+  toast('판매 항목이 추가되고 재고가 반영되었습니다.');
+  await loadState();
+  await openSalesDetail(selectedSalesImportId);
+}
+
+async function saveRates() {
+  await fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      fixed_loss_rate: document.getElementById('set-loss-rate').value,
+      margin_rate: document.getElementById('set-margin-rate').value
+    })
+  });
+  toast('고정 보정로스율 및 마진율이 저장되었습니다.');
+  await loadState();
+}
+
+async function loadReport() {
+  const s = document.getElementById('rep-start').value;
+  const e = document.getElementById('rep-end').value;
+  const m = document.getElementById('rep-meat').value;
+  const res = await fetch(`/api/report?start=${s}&end=${e}&meat=${encodeURIComponent(m)}&_t=${Date.now()}`, {cache: 'no-store'});
+  const data = await res.json();
+  lastReportRows = data.rows || [];
+
+  const prodSel = document.getElementById('rep-prod-select');
+  prodSel.innerHTML = '<option value="">-- 전체 품목 요약 (상세내역을 보려면 품목 선택) --</option>' +
+    lastReportRows.map(r => `<option value="${r.id}">[${r.category}] ${r.name} (슬랍:${fmtKg(r.slab_stock_kg)}kg / 팩:${fmtKg(r.pack_stock_kg)}kg)</option>`).join('');
+  if (selectedReportProdId) {
+    prodSel.value = selectedReportProdId;
+  }
+
+  // 육종별(돼지고기, 소고기, 닭고기) 순구매 KG 및 금액 집계
+  const meatStats = { "돼지고기": {kg:0, amt:0}, "소고기": {kg:0, amt:0}, "닭고기": {kg:0, amt:0} };
+  lastReportRows.forEach(r => {
+    if (meatStats[r.category]) {
+      meatStats[r.category].kg += r.buy_kg;
+      meatStats[r.category].amt += r.buy_amt;
+    }
+  });
+
+  document.getElementById('meat-summary-cards').innerHTML = `
+    <div class="card"><small>🐷 돼지고기 순구매 / 금액</small><strong>${fmtKg(meatStats["돼지고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["돼지고기"].amt)}</div></div>
+    <div class="card"><small>🐮 소고기 순구매 / 금액</small><strong>${fmtKg(meatStats["소고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["소고기"].amt)}</div></div>
+    <div class="card"><small>🐔 닭고기 순구매 / 금액</small><strong>${fmtKg(meatStats["닭고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["닭고기"].amt)}</div></div>
+    <div class="card"><small>📦 전체 합계 순구매 / 금액</small><strong>${fmtKg(meatStats["돼지고기"].kg + meatStats["소고기"].kg + meatStats["닭고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["돼지고기"].amt + meatStats["소고기"].amt + meatStats["닭고기"].amt)}</div></div>
+  `;
+
+  const totSaleAmt = lastReportRows.reduce((a, b) => a + b.sale_amt, 0);
+  const totProfit = lastReportRows.reduce((a, b) => a + b.profit, 0);
+  const totBuyKg = lastReportRows.reduce((a, b) => a + b.buy_kg, 0);
+  const totLossKg = lastReportRows.reduce((a, b) => a + b.total_loss_kg, 0);
+  const avgProfitRate = totSaleAmt > 0 ? (totProfit / totSaleAmt * 100) : 0;
+  const avgLossRate = totBuyKg > 0 ? (totLossKg / totBuyKg * 100) : 0;
+
+  document.getElementById('report-kpi-cards').innerHTML = `
+    <div class="card"><small>조회 기간 총 매출액</small><strong>₱ ${fmt(totSaleAmt)}</strong></div>
+    <div class="card"><small>조회 기간 추정 순익</small><strong>₱ ${fmt(totProfit)}</strong></div>
+    <div class="card"><small>평균 수익률 vs 실로스율</small><strong>${avgProfitRate.toFixed(1)}% / ${avgLossRate.toFixed(1)}%</strong></div>
+    <div class="card"><small>순수익률 격차 (수익률-로스율)</small><strong style="color:${(avgProfitRate-avgLossRate)>=0?'#15803d':'#dc2626'}">${(avgProfitRate - avgLossRate).toFixed(1)}%p</strong></div>
+  `;
+
+  renderReportTable();
+  if (selectedReportProdId) {
+    renderReportDetail(selectedReportProdId);
+  }
+}
+
+function renderReportTable() {
+  document.getElementById('report-body').innerHTML = lastReportRows.map(r => {
+    const gap = r.net_margin_vs_loss;
+    const gapBadge = gap >= 15
+      ? `<span class="badge ok">양호 (+${gap}%p)</span>`
+      : (gap >= 0 ? `<span class="badge carry">주의 (+${gap}%p)</span>` : `<span class="badge low">로스초과 (${gap}%p)</span>`);
+    const minKg = 7.0;
+    const isLow = r.total_stock_kg <= minKg;
+    const isNegative = r.total_stock_kg < 0;
+    const isSel = String(selectedReportProdId) === String(r.id);
+
+    return `<tr class="clickable-row ${isSel ? 'selected-row' : (isNegative ? 'zero-kg' : (isLow ? 'low-stock' : ''))}" onclick="selectReportProduct('${r.id}')">
+      <td>${r.category}</td>
+      <td><b>${r.name}</b></td>
+      <td>₱ ${fmt(r.last_buy_price)}</td><td>₱ ${fmt(r.adjusted_price)}</td><td>₱ ${fmt(r.sale_per_kg)}</td>
+      <td><b>${fmtKg(r.carryover_kg)} kg</b></td><td>${fmtKg(r.buy_kg)}</td><td>₱ ${fmt(r.buy_amt)}</td>
+      <td><b>${r.sale_qty}팩</b> / ${fmtKg(r.sale_kg)}kg</td><td>₱ ${fmt(r.sale_amt)}</td>
+      <td><b>${fmtKg(r.slab_stock_kg)} kg</b></td>
+      <td><b>${fmtKg(r.pack_stock_kg)} kg</b> (${r.pack_count}팩)</td>
+      <td><b>${fmtKg(r.total_stock_kg)} kg</b> <span class="badge ${isLow ? 'low' : 'ok'}">${isLow ? '부족' : '정상'}</span></td>
+      <td>${fmtKg(r.expected_loss_kg)}</td>
+      <td>${fmtKg(r.trim_kg)}</td>
+      <td>${fmtKg(r.waste_kg)}</td>
+      <td><b>${fmtKg(r.total_loss_kg)}</b></td><td><b>${fmtKg(r.actual_loss_rate)}%</b></td><td>₱ ${fmt(r.loss_amt)}</td>
+      <td><b>${fmtKg(r.profit_rate)}%</b></td>
+      <td>${fmtKg(r.profit_rate)}% vs ${fmtKg(r.actual_loss_rate)}% ${gapBadge}</td>
+    </tr>`;
+  }).join('');
+}
+
+function selectReportProduct(pid) {
+  selectedReportProdId = pid ? String(pid) : '';
+  document.getElementById('rep-prod-select').value = selectedReportProdId;
+  renderReportTable();
+  if (!selectedReportProdId) {
+    closeReportDetail();
+    return;
+  }
+  renderReportDetail(selectedReportProdId);
+}
+
+function renderReportDetail(pid) {
+  const item = lastReportRows.find(r => String(r.id) === String(pid));
+  if (!item) {
+    closeReportDetail();
+    return;
+  }
+  const panel = document.getElementById('report-detail-panel');
+  panel.style.display = 'block';
+  const minKg = 7.0;
+  const isLow = item.total_stock_kg <= minKg;
+
+  document.getElementById('report-detail-title').textContent =
+    `[${item.category}] ${item.name} — 슬랍·팩 재고 및 트림·폐기·실로스 상세 내역 (${item.detail_logs.length}건)`;
+
+  document.getElementById('report-detail-cards').innerHTML = `
+    <div class="card"><small>현재 슬랍 재고</small><strong>${fmtKg(item.slab_stock_kg)} KG</strong></div>
+    <div class="card"><small>현재 팩 재고 (${item.pack_count}팩)</small><strong>${fmtKg(item.pack_stock_kg)} KG</strong></div>
+    <div class="card"><small>총 현재고 / 안전재고(7.0kg)</small><strong style="color:${isLow ? '#dc2626' : '#15803d'}">${fmtKg(item.total_stock_kg)} KG (${isLow ? '부족' : '정상'})</strong></div>
+    <div class="card"><small>트림 / 폐기 로스</small><strong>${fmtKg(item.trim_kg)} / ${fmtKg(item.waste_kg)} KG</strong></div>
+    <div class="card"><small>기간 실로스 합계 (실로스율)</small><strong style="color:#dc2626">${fmtKg(item.total_loss_kg)} KG (${fmtKg(item.actual_loss_rate)}%)</strong></div>
+  `;
+
+  const tbody = document.getElementById('report-detail-body');
+  if (!item.detail_logs.length) {
+    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:#64748b;padding:16px;">선택한 조회 기간 내에 등록된 입출고·트림·폐기·실로스 내역이 없습니다.</td></tr>`;
+  } else {
+    tbody.innerHTML = item.detail_logs.map(log => {
+      const hasLoss = log.total_loss_kg > 0 || log.trim_kg > 0 || log.waste_kg > 0;
+      return `<tr class="clickable-row ${hasLoss ? 'zero-kg' : ''}" onclick="jumpToEditFromSummary(${log.id}, '${log.type}')">
+        <td>${log.date}</td>
+        <td><b>${log.type_label}</b></td>
+        <td>${log.origin}</td>
+        <td>${log.qty} 팩</td>
+        <td>${fmtKg(log.slab_kg_delta)} KG</td>
+        <td>${fmtKg(log.pack_kg_delta)} KG</td>
+        <td><b>${fmtKg(log.trim_kg)} KG</b></td>
+        <td><b>${fmtKg(log.waste_kg)} KG</b></td>
+        <td><b>${fmtKg(log.total_loss_kg)} KG</b></td>
+        <td>${log.note} <span style="color:#2563eb;font-size:11px;font-weight:bold;">[수정하기 ➔]</span></td>
+      </tr>`;
+    }).join('');
+  }
+  panel.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+function closeReportDetail() {
+  selectedReportProdId = '';
+  document.getElementById('rep-prod-select').value = '';
+  document.getElementById('report-detail-panel').style.display = 'none';
+  renderReportTable();
+}
+
+function exportExcel(mode) {
+  let start, end, meat = '전체';
+  if (mode === 'report') {
+    start = document.getElementById('rep-start').value;
+    end = document.getElementById('rep-end').value;
+    meat = document.getElementById('rep-meat').value;
+  } else {
+    const base = document.getElementById('dash-target-date').value || getLocalToday();
+    const ym = base.slice(0, 7);
+    const [y, m] = ym.split('-').map(Number);
+    const lastDay = String(new Date(y, m, 0).getDate()).padStart(2, '0');
+    start = `${ym}-01`;
+    end = `${ym}-${lastDay}`;
+  }
+  window.location.href = `/api/export/excel?start=${start}&end=${end}&meat=${encodeURIComponent(meat)}`;
+  toast('엑셀(.xlsx) 보고서 파일 다운로드를 시작합니다.');
+}
+
+function exportBackupJson() {
+  window.location.href = '/api/backup/export';
+  toast('전체 데이터 백업 JSON 파일 다운로드를 시작합니다.');
+}
+
+async function importBackupJson(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (!confirm('백업 JSON 파일로 데이터를 복원하시겠습니까? 기존 데이터가 백업 파일 내용으로 덮어씌워집니다.')) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  const res = await fetch('/api/backup/import', {method: 'POST', body: fd});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('백업 데이터가 성공적으로 복원되었습니다.');
+  await loadState();
+}
+
+async function deleteMovement(movId) {
+  if (!confirm('이 작업 내역을 삭제하시겠습니까? 연동된 재고가 원복됩니다.')) return;
+  const res = await fetch('/api/movements/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: movId})});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('작업 내역이 삭제되고 재고가 원복되었습니다.');
+  await loadState();
+}
+
+async function deleteSnapshotItem(snapId) {
+  if (!confirm('이 복구 스냅샷(백업 이력)을 삭제하시겠습니까?')) return;
+  const res = await fetch('/api/snapshots/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({snapshot_id: snapId})});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('스냅샷 이력이 삭제되었습니다.');
+  await loadState();
+}
+
+function renderHistory() {
+  document.getElementById('snapshot-body').innerHTML = STATE.snapshots.map(s => `
+    <tr>
+      <td>${s.created_at}</td><td>${s.action_label}</td>
+      <td><button class="btn undo" onclick="undoLast(${s.id})">이 시점으로 복구</button></td>
+      <td><button class="btn warn" onclick="deleteSnapshotItem(${s.id})">삭제</button></td>
+    </tr>
+  `).join('');
+
+  const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+  const typeLabel = {
+    "product_receiving": "상품입고", "carryover_inbound": "전월이월(상품)",
+    "slab_inbound": "슬랍입고", "slab_carryover": "전월이월(슬랍)",
+    "slab_production": "생산반영", "trim": "트림", "waste": "폐기", "sale": "판매차감"
+  };
+  document.getElementById('history-body').innerHTML = STATE.movements.map(m => `
+    <tr class="clickable-row" onclick="jumpToEditFromSummary(${m.id}, '${m.type}')">
+      <td>${m.date}</td><td><span class="badge ok">${typeLabel[m.type] || m.type}</span></td><td>${prodMap[m.product_id] || '-'}</td>
+      <td>${m.qty}</td><td>${fmtKg(m.kg_delta)}</td><td>₱ ${fmt(m.amount)}</td><td>₱ ${fmt(m.price_per_kg)}</td><td>${m.note} <span style="color:#2563eb;font-size:11px;font-weight:bold;">[수정하기 ➔]</span></td>
+      <td onclick="event.stopPropagation();"><button class="btn warn" onclick="deleteMovement(${m.id})">삭제</button></td>
+    </tr>
+  `).join('');
+}
+
+async function undoLast(snapId = null) {
+  if (!confirm('선택한 이전 단계 상태로 데이터를 복구하시겠습니까?')) return;
+  const res = await fetch('/api/undo', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({snapshot_id: snapId})});
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('복구 완료: ' + data.label);
+  await loadState();
+}
+
+window.onload = () => {
+  const t = getLocalToday();
+  ['dash-target-date', 'rec-date', 'slab-date', 'prod-run-date', 'trim-date', 'waste-date', 'sales-cal-date', 'rep-end'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = t;
+  });
+  document.getElementById('rep-start').value = t.slice(0, 8) + '01';
+  document.getElementById('sales-cal-month').value = t.slice(0, 7);
+  document.getElementById('prod-cal-month').value = t.slice(0, 7);
+  document.getElementById('rec-cal-month').value = t.slice(0, 7);
+  document.getElementById('trim-cal-month').value = t.slice(0, 7);
+  document.getElementById('waste-cal-month').value = t.slice(0, 7);
+  loadState();
+};
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+if __name__ == "__main__":
+    init_db()
+    threading.Timer(1.0, lambda: webbrowser.open("http://127.0.0.1:5050")).start()
+    app.run(host="0.0.0.0", port=5050, debug=False)
