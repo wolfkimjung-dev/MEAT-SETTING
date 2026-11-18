@@ -82,6 +82,7 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
     c.execute("INSERT OR IGNORE INTO settings (k, v) VALUES ('fixed_loss_rate', '20.0')")
     c.execute("INSERT OR IGNORE INTO settings (k, v) VALUES ('margin_rate', '35.0')")
+    c.execute("INSERT OR IGNORE INTO settings (k, v) VALUES ('product_receiving_stock_migrated', '0')")
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS products (
@@ -183,6 +184,37 @@ def init_db():
                         "INSERT INTO products (name, name_key, category, cut, stock_kind, min_stock_kg) VALUES (?, ?, ?, ?, 'pack', 7.0)",
                         (nm, normalize_key(nm), meat, cut)
                     )
+
+    # Product receiving is purchase-history input only.  Older versions added
+    # these rows to live stock, so remove that duplicate contribution once.
+    migrated = c.execute(
+        "SELECT v FROM settings WHERE k='product_receiving_stock_migrated'"
+    ).fetchone()[0]
+    if migrated != '1':
+        old_receiving = c.execute("""
+            SELECT product_id,
+                   COALESCE(SUM(pack_kg_delta), 0),
+                   COALESCE(SUM(slab_kg_delta), 0),
+                   COALESCE(SUM(pack_delta), 0)
+            FROM movements
+            WHERE type IN ('product_receiving', 'carryover_inbound')
+              AND product_id IS NOT NULL
+            GROUP BY product_id
+        """).fetchall()
+        for r in old_receiving:
+            c.execute("""
+                UPDATE products
+                SET pack_stock_kg=ROUND(pack_stock_kg-?,3),
+                    slab_stock_kg=ROUND(slab_stock_kg-?,3),
+                    pack_count=pack_count-?
+                WHERE id=?
+            """, (r[1], r[2], r[3], r[0]))
+        c.execute("""
+            UPDATE movements
+            SET slab_kg_delta=0, pack_kg_delta=0, pack_delta=0
+            WHERE type IN ('product_receiving', 'carryover_inbound')
+        """)
+        c.execute("UPDATE settings SET v='1' WHERE k='product_receiving_stock_migrated'")
     conn.commit()
     conn.close()
 
@@ -312,24 +344,27 @@ def api_product_save():
         adj_price = num(d.get("adjusted_price"))
     sale_per_kg = num(d.get("sale_per_kg")) if num(d.get("sale_per_kg")) > 0 else auto_sale
 
-    slab_kg = num(d.get("slab_stock_kg"))
-    pack_kg = num(d.get("pack_stock_kg"))
-    pack_cnt = int(num(d.get("pack_count")))
     min_stock_kg = 7.0
     barcode = str(d.get("barcode", "")).strip()
     category = str(d.get("category", "돼지고기")).strip()
     cut = str(d.get("cut", "")).strip()
     stock_kind = str(d.get("stock_kind", "pack")).strip()
+    existing = conn.execute("SELECT * FROM products WHERE id=?", (int(num(pid)),)).fetchone() if pid else None
+    # Live stock is controlled only by slab registration, production, sales, and
+    # waste. Catalog edits must never overwrite it with form values.
+    slab_kg = existing["slab_stock_kg"] if existing else 0.0
+    pack_kg = existing["pack_stock_kg"] if existing else 0.0
+    pack_cnt = existing["pack_count"] if existing else 0
 
     save_snapshot(conn, f"상품 {'수정' if pid else '등록'}: {name}")
     if pid:
         conn.execute("""
             UPDATE products SET name=?, name_key=?, barcode=?, category=?, cut=?, stock_kind=?,
             buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?,
-            slab_stock_kg=?, pack_stock_kg=?, pack_count=?, min_stock_kg=?
+            min_stock_kg=?
             WHERE id=?
         """, (name, normalize_key(name), barcode, category, cut, stock_kind,
-              buy_100g, buy_kg, adj_price, sale_per_kg, slab_kg, pack_kg, pack_cnt, min_stock_kg, pid))
+              buy_100g, buy_kg, adj_price, sale_per_kg, min_stock_kg, pid))
     else:
         conn.execute("""
             INSERT INTO products (name, name_key, barcode, category, cut, stock_kind,
@@ -337,6 +372,12 @@ def api_product_save():
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (name, normalize_key(name), barcode, category, cut, stock_kind,
               buy_100g, buy_kg, adj_price, sale_per_kg, slab_kg, pack_kg, pack_cnt, min_stock_kg))
+
+    # Product identity is shared by catalog, reports, movements, and linked slabs.
+    # Keep those labels synchronized when an existing catalog item is corrected.
+    if pid:
+        conn.execute("UPDATE movements SET meat_type=? WHERE product_id=?", (category, int(num(pid))))
+        conn.execute("UPDATE slabs SET meat_type=?, cut=? WHERE product_id=?", (category, cut, int(num(pid))))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -373,14 +414,12 @@ def api_product_receive():
         sale_price = prod["sale_per_kg"]
 
     net_kg = round(in_kg - loss_kg, 3)
-    new_slab_kg = round(prod["slab_stock_kg"] + (net_kg if target_type == "slab" else 0.0), 3)
-    new_pack_kg = round(prod["pack_stock_kg"] + (net_kg if target_type == "pack" else 0.0), 3)
-    new_pack_cnt = prod["pack_count"] + (in_packs if target_type == "pack" else 0)
-
+    # Only slab registration creates live inventory. This screen records the
+    # purchase detail for reports and history, but never changes stock.
     conn.execute("""
-        UPDATE products SET buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?,
-        slab_stock_kg=?, pack_stock_kg=?, pack_count=? WHERE id=?
-    """, (buy_100g, buy_kg, adj_price, sale_price, new_slab_kg, new_pack_kg, new_pack_cnt, pid))
+        UPDATE products SET buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?
+        WHERE id=?
+    """, (buy_100g, buy_kg, adj_price, sale_price, pid))
 
     mov_type = "carryover_inbound" if is_carryover else "product_receiving"
     note_prefix = "전월이월 재고등록" if is_carryover else "상품 입고"
@@ -391,11 +430,33 @@ def api_product_receive():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (rec_date, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mov_type, pid, prod["category"],
           in_packs, net_kg,
-          net_kg if target_type == "slab" else 0.0,
-          net_kg if target_type == "pack" else 0.0,
-          in_packs if target_type == "pack" else 0,
+          0.0, 0.0, 0,
           loss_kg, buy_kg, total_amount, buy_kg,
           f"{note_prefix} (총 {in_kg}kg / 로스 {loss_kg}kg / 순반영 {net_kg}kg)"))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/products/delete", methods=["POST"])
+def api_product_delete():
+    """Soft-delete an unused catalog item so historical IDs remain stable."""
+    d = request.json or {}
+    pid = int(num(d.get("id")))
+    conn = get_db()
+    prod = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
+    if not prod:
+        conn.close()
+        return jsonify({"ok": False, "error": "삭제할 상품을 찾을 수 없습니다."})
+
+    movement_count = conn.execute("SELECT COUNT(*) FROM movements WHERE product_id=?", (pid,)).fetchone()[0]
+    slab_count = conn.execute("SELECT COUNT(*) FROM slabs WHERE product_id=?", (pid,)).fetchone()[0]
+    has_stock = any(abs(prod[k] or 0) > 0.0001 for k in ("slab_stock_kg", "pack_stock_kg")) or bool(prod["pack_count"])
+    if movement_count or slab_count or has_stock:
+        conn.close()
+        return jsonify({"ok": False, "error": "입출고 이력 또는 재고가 있는 상품은 삭제할 수 없습니다. 이력을 보존하려면 상품명을 수정하세요."})
+
+    save_snapshot(conn, f"상품 카탈로그 삭제: {prod['name']}")
+    conn.execute("UPDATE products SET active=0 WHERE id=?", (pid,))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -431,16 +492,6 @@ def api_product_receive_update():
     save_snapshot(conn, f"상품입고 이력 수정: #{mid}")
 
     old_pid = m["product_id"]
-    if old_pid:
-        old_prod = conn.execute("SELECT * FROM products WHERE id=?", (old_pid,)).fetchone()
-        if old_prod:
-            r_pack_kg = round(old_prod["pack_stock_kg"] - abs(m["pack_kg_delta"] or 0), 3)
-            r_slab_kg = round(old_prod["slab_stock_kg"] - abs(m["slab_kg_delta"] or 0), 3)
-            r_cnt = old_prod["pack_count"] - abs(m["pack_delta"] or 0)
-            conn.execute(
-                "UPDATE products SET pack_stock_kg=?, slab_stock_kg=?, pack_count=? WHERE id=?",
-                (r_pack_kg, r_slab_kg, r_cnt, old_pid)
-            )
 
     fresh_prod = conn.execute("SELECT * FROM products WHERE id=?", (new_pid,)).fetchone()
     if buy_100g > 0:
@@ -452,14 +503,10 @@ def api_product_receive_update():
         sale_price = fresh_prod["sale_per_kg"]
 
     net_kg = round(in_kg - loss_kg, 3)
-    u_slab_kg = round(fresh_prod["slab_stock_kg"] + (net_kg if target_type == "slab" else 0.0), 3)
-    u_pack_kg = round(fresh_prod["pack_stock_kg"] + (net_kg if target_type == "pack" else 0.0), 3)
-    u_pack_cnt = fresh_prod["pack_count"] + (in_packs if target_type == "pack" else 0)
-
     conn.execute("""
-        UPDATE products SET buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?,
-        slab_stock_kg=?, pack_stock_kg=?, pack_count=? WHERE id=?
-    """, (buy_100g, buy_kg, adj_price, sale_price, u_slab_kg, u_pack_kg, u_pack_cnt, new_pid))
+        UPDATE products SET buy_price_100g=?, buy_price_kg=?, adjusted_price=?, sale_per_kg=?
+        WHERE id=?
+    """, (buy_100g, buy_kg, adj_price, sale_price, new_pid))
 
     mov_type = "carryover_inbound" if is_carryover else "product_receiving"
     note_prefix = "전월이월 재고등록(수정)" if is_carryover else "상품 입고(수정)"
@@ -469,9 +516,7 @@ def api_product_receive_update():
         slab_kg_delta=?, pack_kg_delta=?, pack_delta=?, loss_kg=?, unit_price=?, amount=?, price_per_kg=?, note=?
         WHERE id=?
     """, (rec_date, mov_type, new_pid, fresh_prod["category"], in_packs, net_kg,
-          net_kg if target_type == "slab" else 0.0,
-          net_kg if target_type == "pack" else 0.0,
-          in_packs if target_type == "pack" else 0,
+          0.0, 0.0, 0,
           loss_kg, buy_kg, total_amount, buy_kg,
           f"{note_prefix} (총 {in_kg}kg / 로스 {loss_kg}kg / 순반영 {net_kg}kg)", mid))
 
@@ -519,6 +564,9 @@ def api_slab_receive():
                          (old["remaining_kg"], old_pid))
 
         consumed_kg = old["kg"] - old["remaining_kg"]
+        if kg < consumed_kg - 0.0001:
+            conn.close()
+            return jsonify({"ok": False, "error": f"이미 생산·트림으로 사용된 {consumed_kg:.3f}kg보다 작은 원물 중량으로 수정할 수 없습니다."})
         new_rem = round(kg - consumed_kg, 3)
         status = "done" if new_rem <= 0.0001 else "open"
 
@@ -567,6 +615,13 @@ def api_slab_delete():
     if not slab:
         conn.close()
         return jsonify({"ok": False, "error": "삭제할 슬랍을 찾을 수 없습니다."})
+    child_count = conn.execute(
+        "SELECT COUNT(*) FROM movements WHERE slab_id=? AND type NOT IN ('slab_inbound', 'slab_carryover')",
+        (sid,)
+    ).fetchone()[0]
+    if child_count:
+        conn.close()
+        return jsonify({"ok": False, "error": "생산·트림 이력이 연결된 슬랍은 삭제할 수 없습니다. 연결 이력을 먼저 삭제한 뒤 다시 시도하세요."})
     save_snapshot(conn, f"슬랍 삭제: #{slab['slab_no'] or slab['id']}")
     
     t_pid = slab["product_id"]
@@ -601,6 +656,9 @@ def api_slab_production():
     if not slab or not prod or input_kg <= 0:
         conn.close()
         return jsonify({"ok": False, "error": "입고 날짜별 슬랍과 생산 상품, 투입 KG를 정확히 입력하세요."})
+    if input_kg > slab["remaining_kg"] + 0.0001:
+        conn.close()
+        return jsonify({"ok": False, "error": f"현재 슬랍 잔량({slab['remaining_kg']:.3f}kg)을 초과해 생산할 수 없습니다."})
 
     save_snapshot(conn, f"슬랍 생산반영: {slab['slab_no']} -> {prod['name']}")
     rem = round(slab["remaining_kg"] - input_kg, 3)
@@ -608,7 +666,7 @@ def api_slab_production():
 
     conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (rem, status, slab_id))
     
-    target_slab_pid = slab.get("product_id")
+    target_slab_pid = slab["product_id"]
     if not target_slab_pid:
         match_p = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
         if match_p:
@@ -668,7 +726,7 @@ def api_slab_production_update():
     if old_slab:
         r_rem = round(old_slab["remaining_kg"] + old_in_kg, 3)
         conn.execute("UPDATE slabs SET remaining_kg=?, status='open' WHERE id=?", (r_rem, old_slab["id"]))
-        old_slab_pid = old_slab.get("product_id")
+        old_slab_pid = old_slab["product_id"]
         if not old_slab_pid:
             match_op = resolve_slab_product(conn, None, old_slab["meat_type"], old_slab["cut"])
             if match_op: old_slab_pid = match_op["id"]
@@ -680,11 +738,15 @@ def api_slab_production_update():
                      (old_out_kg, old_packs, old_prod["id"]))
 
     fresh_slab = conn.execute("SELECT * FROM slabs WHERE id=?", (new_slab_id,)).fetchone()
+    if new_in_kg > fresh_slab["remaining_kg"] + 0.0001:
+        conn.rollback()
+        conn.close()
+        return jsonify({"ok": False, "error": f"현재 슬랍 잔량({fresh_slab['remaining_kg']:.3f}kg)을 초과해 수정할 수 없습니다."})
     n_rem = round(fresh_slab["remaining_kg"] - new_in_kg, 3)
     n_status = "done" if n_rem <= 0.0001 else "open"
     conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (n_rem, n_status, new_slab_id))
     
-    new_slab_pid = fresh_slab.get("product_id")
+    new_slab_pid = fresh_slab["product_id"]
     if not new_slab_pid:
         match_np = resolve_slab_product(conn, None, fresh_slab["meat_type"], fresh_slab["cut"])
         if match_np: new_slab_pid = match_np["id"]
@@ -722,6 +784,9 @@ def api_slab_trim():
     if not slab or trim_kg <= 0:
         conn.close()
         return jsonify({"ok": False, "error": "슬랍과 트림 KG를 입력하세요."})
+    if trim_kg > slab["remaining_kg"] + 0.0001:
+        conn.close()
+        return jsonify({"ok": False, "error": f"현재 슬랍 잔량({slab['remaining_kg']:.3f}kg)을 초과해 트림할 수 없습니다."})
 
     if not product_id and slab["product_id"]:
         product_id = slab["product_id"]
@@ -731,7 +796,7 @@ def api_slab_trim():
     status = "done" if rem <= 0.0001 else "open"
     conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (rem, status, slab_id))
     
-    t_pid = slab.get("product_id")
+    t_pid = slab["product_id"]
     if not t_pid:
         mp = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
         if mp: t_pid = mp["id"]
@@ -779,7 +844,7 @@ def api_slab_trim_update():
     if old_slab:
         r_rem = round(old_slab["remaining_kg"] + old_trim_kg, 3)
         conn.execute("UPDATE slabs SET remaining_kg=?, status='open' WHERE id=?", (r_rem, old_slab["id"]))
-        old_spid = old_slab.get("product_id")
+        old_spid = old_slab["product_id"]
         if not old_spid:
             mp = resolve_slab_product(conn, None, old_slab["meat_type"], old_slab["cut"])
             if mp: old_spid = mp["id"]
@@ -791,11 +856,16 @@ def api_slab_trim_update():
     if not new_prod_id and fresh_slab["product_id"]:
         new_prod_id = fresh_slab["product_id"]
 
+    if new_trim_kg > fresh_slab["remaining_kg"] + 0.0001:
+        conn.rollback()
+        conn.close()
+        return jsonify({"ok": False, "error": f"현재 슬랍 잔량({fresh_slab['remaining_kg']:.3f}kg)을 초과해 수정할 수 없습니다."})
+
     n_rem = round(fresh_slab["remaining_kg"] - new_trim_kg, 3)
     n_status = "done" if n_rem <= 0.0001 else "open"
     conn.execute("UPDATE slabs SET remaining_kg=?, status=? WHERE id=?", (n_rem, n_status, new_slab_id))
     
-    new_spid = fresh_slab.get("product_id")
+    new_spid = fresh_slab["product_id"]
     if not new_spid:
         mp = resolve_slab_product(conn, None, fresh_slab["meat_type"], fresh_slab["cut"])
         if mp: new_spid = mp["id"]
@@ -943,6 +1013,15 @@ def api_movement_delete():
         conn.close()
         return jsonify({"ok": False, "error": "해당 작업 내역을 찾을 수 없습니다."})
 
+    if m["type"] in ("slab_inbound", "slab_carryover") and m["slab_id"]:
+        child_count = conn.execute(
+            "SELECT COUNT(*) FROM movements WHERE slab_id=? AND id<>? AND type NOT IN ('slab_inbound', 'slab_carryover')",
+            (m["slab_id"], m["id"])
+        ).fetchone()[0]
+        if child_count:
+            conn.close()
+            return jsonify({"ok": False, "error": "생산·트림 이력이 연결된 슬랍 입고는 삭제할 수 없습니다. 연결 이력을 먼저 삭제하세요."})
+
     save_snapshot(conn, f"작업내역 삭제 및 원복: #{mid} ({m['type']})")
     pid = m["product_id"]
     sid = m["slab_id"]
@@ -965,7 +1044,7 @@ def api_movement_delete():
             restore_kg = abs(m["slab_kg_delta"] or 0)
             new_rem = round(slab["remaining_kg"] + restore_kg, 3)
             conn.execute("UPDATE slabs SET remaining_kg=?, status='open' WHERE id=?", (new_rem, sid))
-            s_pid = slab.get("product_id")
+            s_pid = slab["product_id"]
             if not s_pid:
                 mp = resolve_slab_product(conn, None, slab["meat_type"], slab["cut"])
                 if mp: s_pid = mp["id"]
@@ -973,7 +1052,9 @@ def api_movement_delete():
                 conn.execute("UPDATE products SET slab_stock_kg = ROUND(slab_stock_kg + ?, 3) WHERE id=?",
                              (restore_kg, s_pid))
 
-    if pid and m["type"] in ("sale", "waste", "product_receiving", "carryover_inbound", "slab_production", "slab_carryover"):
+    # Slab inbound/carryover stock is reversed above together with its slab row;
+    # excluding it here prevents a second subtraction from the linked catalog item.
+    if pid and m["type"] in ("sale", "waste", "product_receiving", "carryover_inbound", "slab_production"):
         prod = conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
         if prod:
             if m["type"] == "sale":
@@ -993,7 +1074,7 @@ def api_movement_delete():
                 new_cnt = prod["pack_count"] - abs(m["pack_delta"] or m["qty"] or 0)
                 conn.execute("UPDATE products SET pack_stock_kg=?, pack_count=? WHERE id=?",
                              (new_pack_kg, new_cnt, pid))
-            elif m["type"] in ("product_receiving", "carryover_inbound", "slab_carryover", "slab_inbound"):
+            elif m["type"] in ("product_receiving", "carryover_inbound"):
                 new_pack_kg = round(prod["pack_stock_kg"] - abs(m["pack_kg_delta"] or 0), 3)
                 new_slab_kg = round(prod["slab_stock_kg"] - abs(m["slab_kg_delta"] or 0), 3)
                 new_cnt = prod["pack_count"] - abs(m["pack_delta"] or 0)
@@ -1043,19 +1124,31 @@ def api_product_history(pid):
         conn.close()
         return jsonify({"ok": False, "error": "상품을 찾을 수 없습니다."})
     
-    movs = conn.execute("""
+    start_dt = request.args.get("start", "").strip()
+    end_dt = request.args.get("end", "").strip()
+    date_clause = ""
+    params = [pid]
+    if start_dt:
+        date_clause += " AND substr(m.date,1,10) >= ?"
+        params.append(start_dt)
+    if end_dt:
+        date_clause += " AND substr(m.date,1,10) <= ?"
+        params.append(end_dt)
+    movs = conn.execute(f"""
         SELECT m.*, s.slab_no AS slab_number, s.cut AS slab_cut
         FROM movements m
         LEFT JOIN slabs s ON m.slab_id = s.id
-        WHERE m.product_id = ?
+        WHERE m.product_id = ? {date_clause}
         ORDER BY m.date DESC, m.id DESC
-        LIMIT 100
-    """, (pid,)).fetchall()
+        LIMIT 1000
+    """, params).fetchall()
     conn.close()
     return jsonify({
         "ok": True,
         "product": dict(prod),
-        "movements": [dict(m) for m in movs]
+        "movements": [dict(m) for m in movs],
+        "start": start_dt,
+        "end": end_dt
     })
 
 def recalc_sales_import_summary(conn, si):
@@ -1558,7 +1651,20 @@ def api_report():
     end_dt = request.args.get("end") or date.today().isoformat()
     meat_filter = request.args.get("meat") or "전체"
     fixed_loss_pct, report_rows = build_report_data(start_dt, end_dt, meat_filter)
-    return jsonify({"ok": True, "fixed_loss_pct": fixed_loss_pct, "rows": report_rows})
+    conn = get_db()
+    purchase_rows = conn.execute("""
+        SELECT meat_type, COALESCE(SUM(kg_delta),0) AS kg, COALESCE(SUM(amount),0) AS amount
+        FROM movements
+        WHERE substr(date,1,10) BETWEEN ? AND ?
+          AND type IN ('product_receiving', 'slab_inbound')
+        GROUP BY meat_type
+    """, (start_dt, end_dt)).fetchall()
+    conn.close()
+    meat_summary = {k: {"kg": 0.0, "amount": 0.0} for k in ("돼지고기", "소고기", "닭고기")}
+    for r in purchase_rows:
+        if r["meat_type"] in meat_summary and (meat_filter == "전체" or r["meat_type"] == meat_filter):
+            meat_summary[r["meat_type"]] = {"kg": round(r["kg"] or 0, 3), "amount": round(r["amount"] or 0, 2)}
+    return jsonify({"ok": True, "fixed_loss_pct": fixed_loss_pct, "rows": report_rows, "meat_summary": meat_summary})
 
 @app.route("/api/backup/export", methods=["GET"])
 def api_backup_export():
@@ -1841,6 +1947,14 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="btn" onclick="closeProductModal()">닫기 ✕</button>
       </div>
       <div id="modal-product-summary" style="display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin-bottom:16px;"></div>
+      <div class="form-row" style="background:#f8fafc;padding:8px;border-radius:8px;">
+        <b style="font-size:12px;">히스토리 기간:</b>
+        <input type="date" id="product-history-start">
+        <span>~</span>
+        <input type="date" id="product-history-end">
+        <button class="btn primary" onclick="reloadProductHistory()">기간 조회</button>
+        <button class="btn" onclick="clearProductHistoryFilter()">전체 이력</button>
+      </div>
       <h3 style="font-size:14px; margin-bottom:8px;">📋 해당 품목의 전체 입출고·판매 내역 ( 행을 클릭하면 곧바로 수정/관리 화면으로 이동합니다 )</h3>
       <div style="max-height:400px; overflow-y:auto;">
         <table>
@@ -1863,7 +1977,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div style="max-height:450px; overflow-y:auto;">
         <table>
           <thead>
-            <tr><th>입고일</th><th>육종</th><th>부위</th><th>슬랍번호</th><th>최초KG</th><th>잔여KG</th><th>매입단가(₱/kg)</th><th>상태</th></tr>
+            <tr><th>입고일</th><th>육종</th><th>부위</th><th>슬랍번호</th><th>최초KG</th><th>잔여KG</th><th>매입단가(₱/kg)</th><th>총 구매금액</th><th>상태</th></tr>
           </thead>
           <tbody id="slab-summary-modal-body"></tbody>
         </table>
@@ -1934,7 +2048,7 @@ HTML_PAGE = """<!DOCTYPE html>
   <!-- 2. 상품·재고 관리 & 입고달력 (육종별 탭 분리 적용) -->
   <section id="tab-products" style="display:none;">
     <div class="panel">
-      <h2>상품 입고 / 전월 이월 재고 등록·수정 & 입고 달력 히스토리</h2>
+      <h2>상품 구매기록 입력·수정 & 입고 달력 히스토리 <span style="font-size:12px;color:#dc2626;">※ 구매기록만 저장되며 실재고에는 반영되지 않습니다. 실재고는 슬랍 등록분만 반영됩니다.</span></h2>
       <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;">
         <div>
           <div style="margin-bottom:6px;display:flex;gap:6px;align-items:center;">
@@ -1954,7 +2068,7 @@ HTML_PAGE = """<!DOCTYPE html>
               <option value="닭고기">닭고기</option>
             </select>
             <select id="rec-prod" style="min-width:200px;"></select>
-            <select id="rec-target"><option value="pack">팩 재고로 반영</option><option value="slab">슬랍 재고로 반영</option></select>
+            <input type="hidden" id="rec-target" value="pack">
           </div>
           <div class="form-row">
             <input type="number" step="0.01" id="rec-buy100" placeholder="매입단가 (100g당 ₱)">
@@ -1963,14 +2077,22 @@ HTML_PAGE = """<!DOCTYPE html>
           </div>
           <div class="form-row">
             <label style="font-size:12.5px;color:#1e40af;font-weight:bold;">
-              <input type="checkbox" id="rec-carryover"> 전월 이월 재고 (구매KG 제외 및 재고 정상적용)
+              <input type="checkbox" id="rec-carryover"> 전월 이월 구매기록 (구매금액·당기구매에서 제외)
             </label>
             <button class="btn primary" id="btn-rec-submit" onclick="submitProductReceive()">입고 등록 실행</button>
             <button class="btn" id="btn-rec-cancel" style="display:none;" onclick="resetReceiveForm()">수정 취소</button>
           </div>
         </div>
       </div>
-      <h3 style="margin-top:14px;font-size:14px;">상품 입고 및 전월이월 이력 목록 (입고 KG, 순반영 KG, 단가, 총 구매금액 포함)</h3>
+      <h3 style="margin-top:14px;font-size:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <span>상품 입고 및 전월이월 이력 목록 (입고 KG, 순반영 KG, 단가, 총 구매금액 포함)</span>
+        <span class="subtabs" style="margin:0;">
+          <button class="active" onclick="filterReceivingPart('전체', this)">전체</button>
+          <button onclick="filterReceivingPart('돼지고기', this)">돼지고기</button>
+          <button onclick="filterReceivingPart('소고기', this)">소고기</button>
+          <button onclick="filterReceivingPart('닭고기', this)">닭고기</button>
+        </span>
+      </h3>
       <table>
         <thead>
           <tr><th>기준일</th><th>구분</th><th>반영대상</th><th>상품명</th><th>수량(팩)</th><th>입고 KG</th><th>순반영 KG</th><th>단가(₱/kg)</th><th>총 구매금액(₱)</th><th>메모</th><th>관리</th></tr>
@@ -1993,9 +2115,9 @@ HTML_PAGE = """<!DOCTYPE html>
         <input type="number" step="0.01" id="prod-buy100" placeholder="매입단가(100g당 ₱)" oninput="previewCalcPrice()">
         <input type="number" step="0.01" id="prod-adj" placeholder="보정단가(₱/kg)">
         <input type="number" step="0.01" id="prod-sale" placeholder="판매가(₱/kg)">
-        <input type="number" step="0.001" id="prod-slab-kg" placeholder="슬랍 재고 KG">
-        <input type="number" step="0.001" id="prod-pack-kg" placeholder="팩 재고 KG">
-        <input type="number" id="prod-pack-cnt" placeholder="팩 개수">
+        <input type="number" step="0.001" id="prod-slab-kg" placeholder="슬랍 재고 KG (자동)" readonly style="background:#f1f5f9;">
+        <input type="number" step="0.001" id="prod-pack-kg" placeholder="팩 재고 KG (자동)" readonly style="background:#f1f5f9;">
+        <input type="number" id="prod-pack-cnt" placeholder="팩 개수 (자동)" readonly style="background:#f1f5f9;">
         <input type="hidden" id="prod-min-kg" value="7">
         <button class="btn primary" onclick="saveProduct()">저장 / 수정반영</button>
         <button class="btn" onclick="resetProdForm()">초기화</button>
@@ -2022,6 +2144,16 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <!-- 3. 슬랍 원물·생산·트림·폐기 -->
   <section id="tab-slabs" style="display:none;">
+    <div class="panel" style="padding:10px 14px;">
+      <b>슬랍 원물 육종별 보기:</b>
+      <select id="slab-global-meat-filter" onchange="setSlabGlobalFilter(this.value)">
+        <option value="전체">전체</option>
+        <option value="돼지고기">돼지고기</option>
+        <option value="소고기">소고기</option>
+        <option value="닭고기">닭고기</option>
+      </select>
+      <span style="font-size:12px;color:#64748b;margin-left:8px;">입고·생산·트림·폐기 목록과 요약에 함께 적용됩니다.</span>
+    </div>
     <div class="grid-4" id="slab-summary-cards"></div>
 
     <div class="subtabs">
@@ -2086,7 +2218,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
       <table>
         <thead>
-          <tr><th>기준일</th><th>구분</th><th>육종</th><th>부위</th><th>연관상품</th><th>슬랍번호</th><th>최초KG</th><th>잔량KG</th><th>매입가/kg</th><th>상태</th><th>관리</th></tr>
+          <tr><th>기준일</th><th>구분</th><th>육종</th><th>부위</th><th>연관상품</th><th>슬랍번호</th><th>최초KG</th><th>잔량KG</th><th>매입가/kg</th><th>총 구매금액</th><th>상태</th><th>관리</th></tr>
         </thead>
         <tbody id="slab-table-body"></tbody>
       </table>
@@ -2385,6 +2517,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <script>
 let STATE = null;
 let prodPartFilter = '전체';
+let receivingPartFilter = '전체';
 let selectedCalDate = '';
 let selectedProdCalDate = '';
 let selectedRecCalDate = '';
@@ -2393,6 +2526,7 @@ let selectedWasteCalDate = '';
 let salesPreviewData = null;
 let lastReportRows = [];
 let selectedReportProdId = '';
+let currentProductHistoryPid = null;
 
 function getLocalToday() {
   const now = new Date();
@@ -2627,7 +2761,11 @@ function jumpToEditFromSummary(movId, movType) {
 }
 
 async function openProductDetailModal(pid) {
-  const res = await fetch(`/api/products/history/${pid}?_t=${Date.now()}`, {cache: 'no-store'});
+  currentProductHistoryPid = pid;
+  const start = document.getElementById('product-history-start').value;
+  const end = document.getElementById('product-history-end').value;
+  const qs = new URLSearchParams({start, end, _t: Date.now()});
+  const res = await fetch(`/api/products/history/${pid}?${qs.toString()}`, {cache: 'no-store'});
   const data = await res.json();
   if (!data.ok) return alert(data.error);
 
@@ -2673,13 +2811,24 @@ async function openProductDetailModal(pid) {
   document.getElementById('product-modal').style.display = 'flex';
 }
 
+function reloadProductHistory() {
+  if (currentProductHistoryPid) openProductDetailModal(currentProductHistoryPid);
+}
+
+function clearProductHistoryFilter() {
+  document.getElementById('product-history-start').value = '';
+  document.getElementById('product-history-end').value = '';
+  reloadProductHistory();
+}
+
 function closeProductModal() {
   document.getElementById('product-modal').style.display = 'none';
 }
 
 function openSlabSummaryModal(filterType) {
-  let slabsList = STATE.slabs;
-  let title = "전체 슬랍 원물 현황";
+  const globalMeat = document.getElementById('slab-global-meat-filter')?.value || '전체';
+  let slabsList = STATE.slabs.filter(s => globalMeat === '전체' || s.meat_type === globalMeat);
+  let title = `[${globalMeat}] 슬랍 원물 현황`;
 
   if (filterType === 'total_kg') {
     title = "보유중인 전체 슬랍 상세 목록 (잔여 KG 기준)";
@@ -2695,7 +2844,7 @@ function openSlabSummaryModal(filterType) {
   document.getElementById('slab-summary-modal-title').textContent = title;
   const tbody = document.getElementById('slab-summary-modal-body');
   if (!slabsList.length) {
-    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;color:#64748b;padding:20px;">등록된 슬랍이 없습니다.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:#64748b;padding:20px;">등록된 슬랍이 없습니다.</td></tr>`;
   } else {
     tbody.innerHTML = slabsList.map(s => {
       const isZero = s.remaining_kg <= 0.0001;
@@ -2706,7 +2855,7 @@ function openSlabSummaryModal(filterType) {
         <td>#${s.slab_no || s.id}</td>
         <td>${fmtKg(s.kg)} KG</td>
         <td><b>${fmtKg(s.remaining_kg)} KG</b></td>
-        <td>₱ ${fmt(s.buy_price_kg)}</td>
+        <td>₱ ${fmt(s.buy_price_kg)}</td><td>₱ ${fmt(s.kg * s.buy_price_kg)}</td>
         <td><span class="badge ${isZero ? 'low' : 'ok'}">${isZero ? '소진' : '보유중'}</span></td>
       </tr>`;
     }).join('');
@@ -2767,7 +2916,10 @@ function renderProducts() {
         <td>₱ ${fmt(p.adjusted_price)}</td><td>₱ ${fmt(p.sale_per_kg)}</td>
         <td>${fmtKg(p.slab_stock_kg)}</td><td>${fmtKg(p.pack_stock_kg)}</td><td>${p.pack_count}</td>
         <td><b>${fmtKg(tot)}</b></td><td>7.0 kg</td><td>₱ ${fmt(val)}</td>
-        <td><button class="btn" onclick='editProduct(${JSON.stringify(p)})'>수정</button></td>
+        <td>
+          <button class="btn" onclick='editProduct(${JSON.stringify(p)})'>수정</button>
+          <button class="btn warn" onclick="deleteProduct(${p.id})">삭제</button>
+        </td>
       </tr>`;
     }).join('');
 }
@@ -2800,7 +2952,10 @@ function renderReceivingCalendar() {
 
 function renderReceivingTable() {
   const recMovs = STATE.movements.filter(m => m.type === 'product_receiving' || m.type === 'carryover_inbound');
-  const list = selectedRecCalDate ? recMovs.filter(m => (m.date || '').slice(0, 10) === selectedRecCalDate) : recMovs;
+  const dateFiltered = selectedRecCalDate ? recMovs.filter(m => (m.date || '').slice(0, 10) === selectedRecCalDate) : recMovs;
+  const list = receivingPartFilter === '전체'
+    ? dateFiltered
+    : dateFiltered.filter(m => m.meat_type === receivingPartFilter);
   const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
 
   document.getElementById('receiving-table-body').innerHTML = list.map(m => {
@@ -2827,6 +2982,13 @@ function renderReceivingTable() {
       </td>
     </tr>`;
   }).join('');
+}
+
+function filterReceivingPart(part, btn) {
+  receivingPartFilter = part;
+  btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderReceivingTable();
 }
 
 function editReceiveMovement(m) {
@@ -2915,6 +3077,21 @@ async function saveProduct() {
   await loadState();
 }
 
+async function deleteProduct(productId) {
+  const product = STATE.products.find(p => String(p.id) === String(productId));
+  if (!product) return alert('상품을 찾을 수 없습니다.');
+  if (!confirm(`[${product.category}] ${product.name} 카탈로그를 삭제하시겠습니까?\n재고나 입출고 이력이 있는 상품은 데이터 보존을 위해 삭제되지 않습니다.`)) return;
+  const res = await fetch('/api/products/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id: productId})
+  });
+  const data = await res.json();
+  if (!data.ok) return alert(data.error);
+  toast('카탈로그가 삭제되었고 과거 이력은 보존되었습니다.');
+  await loadState();
+}
+
 async function submitProductReceive() {
   const editId = document.getElementById('edit-rec-id').value;
   const endpoint = editId ? '/api/products/receive/update' : '/api/products/receive';
@@ -2954,13 +3131,16 @@ function toggleSlabCarryoverMode() {
 }
 
 function renderSlabSection() {
-  const totalSlabKg = STATE.slabs.reduce((a, b) => a + (b.remaining_kg || 0), 0);
-  const openCount = STATE.slabs.filter(s => s.remaining_kg > 0.0001).length;
-  const totalTrim = STATE.movements.reduce((a, b) => a + (b.trim_kg || 0), 0);
-  const totalWaste = STATE.movements.reduce((a, b) => a + (b.waste_kg || 0), 0);
+  const meatFilter = document.getElementById('slab-global-meat-filter')?.value || '전체';
+  const slabMatches = s => meatFilter === '전체' || s.meat_type === meatFilter;
+  const movMatches = m => meatFilter === '전체' || m.meat_type === meatFilter;
+  const totalSlabKg = STATE.slabs.filter(slabMatches).reduce((a, b) => a + (b.remaining_kg || 0), 0);
+  const openCount = STATE.slabs.filter(s => slabMatches(s) && s.remaining_kg > 0.0001).length;
+  const totalTrim = STATE.movements.filter(m => movMatches(m)).reduce((a, b) => a + (b.trim_kg || 0), 0);
+  const totalWaste = STATE.movements.filter(m => movMatches(m)).reduce((a, b) => a + (b.waste_kg || 0), 0);
 
   document.getElementById('slab-summary-cards').innerHTML = `
-    <div class="card" onclick="openSlabSummaryModal('total_kg')"><small>현재 슬랍 총 잔여 KG (클릭시 상세)</small><strong>${fmtKg(totalSlabKg)} KG</strong></div>
+    <div class="card" onclick="openSlabSummaryModal('total_kg')"><small>[${meatFilter}] 현재 슬랍 총 잔여 KG (클릭시 상세)</small><strong>${fmtKg(totalSlabKg)} KG</strong></div>
     <div class="card" onclick="openSlabSummaryModal('count')"><small>보유 슬랍 개수 (클릭시 상세)</small><strong>${openCount} 개</strong></div>
     <div class="card" onclick="openSlabSummaryModal('trim')"><small>누적 트림 KG (클릭시 상세)</small><strong>${fmtKg(totalTrim)} KG</strong></div>
     <div class="card" onclick="openSlabSummaryModal('loss')"><small>누적 폐기 KG (클릭시 상세)</small><strong>${fmtKg(totalWaste)} KG</strong></div>
@@ -2980,6 +3160,12 @@ function renderSlabSection() {
   renderTrimTable();
   renderWasteCalendar();
   renderWasteTable();
+}
+
+function setSlabGlobalFilter(meat) {
+  const local = document.getElementById('slab-table-meat-filter');
+  if (local) local.value = meat;
+  renderSlabSection();
 }
 
 function updateSlabProductSelect() {
@@ -3109,7 +3295,7 @@ function renderWasteCalendar() {
 
 function renderSlabTable() {
   const todayStr = getLocalToday();
-  const meatFilter = document.getElementById('slab-table-meat-filter').value;
+  const meatFilter = document.getElementById('slab-global-meat-filter')?.value || document.getElementById('slab-table-meat-filter').value;
   let list = selectedCalDate ? STATE.slabs.filter(s => s.date === selectedCalDate) : STATE.slabs;
   if (meatFilter !== '전체') {
     list = list.filter(s => s.meat_type === meatFilter);
@@ -3127,7 +3313,7 @@ function renderSlabTable() {
       <td>${s.date}</td>
       <td>${isCarry ? '<span class="badge carry">전월이월</span>' : '<span class="badge ok">당월입고</span>'}</td>
       <td>${s.meat_type}</td><td>${s.cut}</td><td><b>${pName}</b></td><td><b>${s.slab_no || '-'}</b></td>
-      <td>${fmtKg(s.kg)}</td><td><b>${fmtKg(s.remaining_kg)}</b></td><td>₱ ${fmt(s.buy_price_kg)}</td>
+      <td>${fmtKg(s.kg)}</td><td><b>${fmtKg(s.remaining_kg)}</b></td><td>₱ ${fmt(s.buy_price_kg)}</td><td>₱ ${fmt(s.kg * s.buy_price_kg)}</td>
       <td>${isNegative ? '음수초과' : (isZero ? '소진(0KG)' : '보유중')}</td>
       <td onclick="event.stopPropagation();">
         <button class="btn" onclick='editSlab(${JSON.stringify(s)})'>수정</button>
@@ -3139,7 +3325,9 @@ function renderSlabTable() {
 
 function renderProductionTable() {
   const prodMovs = STATE.movements.filter(m => m.type === 'slab_production');
-  const list = selectedProdCalDate ? prodMovs.filter(m => (m.date || '').slice(0, 10) === selectedProdCalDate) : prodMovs;
+  const meatFilter = document.getElementById('slab-global-meat-filter')?.value || '전체';
+  const filtered = meatFilter === '전체' ? prodMovs : prodMovs.filter(m => m.meat_type === meatFilter);
+  const list = selectedProdCalDate ? filtered.filter(m => (m.date || '').slice(0, 10) === selectedProdCalDate) : filtered;
   const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
   const slabMap = Object.fromEntries(STATE.slabs.map(s => [s.id, s]));
 
@@ -3169,7 +3357,9 @@ function renderProductionTable() {
 
 function renderTrimTable() {
   const trimMovs = STATE.movements.filter(m => m.type === 'trim');
-  const list = selectedTrimCalDate ? trimMovs.filter(m => (m.date || '').slice(0, 10) === selectedTrimCalDate) : trimMovs;
+  const meatFilter = document.getElementById('slab-global-meat-filter')?.value || '전체';
+  const filtered = meatFilter === '전체' ? trimMovs : trimMovs.filter(m => m.meat_type === meatFilter);
+  const list = selectedTrimCalDate ? filtered.filter(m => (m.date || '').slice(0, 10) === selectedTrimCalDate) : filtered;
   const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
   const slabMap = Object.fromEntries(STATE.slabs.map(s => [s.id, s]));
 
@@ -3221,7 +3411,9 @@ function resetTrimForm() {
 
 function renderWasteTable() {
   const wasteMovs = STATE.movements.filter(m => m.type === 'waste');
-  const list = selectedWasteCalDate ? wasteMovs.filter(m => (m.date || '').slice(0, 10) === selectedWasteCalDate) : wasteMovs;
+  const meatFilter = document.getElementById('slab-global-meat-filter')?.value || '전체';
+  const filtered = meatFilter === '전체' ? wasteMovs : wasteMovs.filter(m => m.meat_type === meatFilter);
+  const list = selectedWasteCalDate ? filtered.filter(m => (m.date || '').slice(0, 10) === selectedWasteCalDate) : filtered;
   const prodMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
 
   document.getElementById('waste-table-body').innerHTML = list.map(m => {
@@ -3731,17 +3923,17 @@ async function loadReport() {
 
   // 육종별(돼지고기, 소고기, 닭고기) 순구매 KG 및 금액 집계
   const meatStats = { "돼지고기": {kg:0, amt:0}, "소고기": {kg:0, amt:0}, "닭고기": {kg:0, amt:0} };
-  lastReportRows.forEach(r => {
-    if (meatStats[r.category]) {
-      meatStats[r.category].kg += r.buy_kg;
-      meatStats[r.category].amt += r.buy_amt;
+  Object.entries(data.meat_summary || {}).forEach(([category, v]) => {
+    if (meatStats[category]) {
+      meatStats[category].kg = Number(v.kg || 0);
+      meatStats[category].amt = Number(v.amount || 0);
     }
   });
 
   document.getElementById('meat-summary-cards').innerHTML = `
-    <div class="card"><small>🐷 돼지고기 순구매 / 금액</small><strong>${fmtKg(meatStats["돼지고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["돼지고기"].amt)}</div></div>
-    <div class="card"><small>🐮 소고기 순구매 / 금액</small><strong>${fmtKg(meatStats["소고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["소고기"].amt)}</div></div>
-    <div class="card"><small>🐔 닭고기 순구매 / 금액</small><strong>${fmtKg(meatStats["닭고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["닭고기"].amt)}</div></div>
+    <div class="card" onclick="openMeatPurchaseDetail('돼지고기')"><small>🐷 돼지고기 순구매 / 금액 · 클릭 상세</small><strong>${fmtKg(meatStats["돼지고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["돼지고기"].amt)}</div></div>
+    <div class="card" onclick="openMeatPurchaseDetail('소고기')"><small>🐮 소고기 순구매 / 금액 · 클릭 상세</small><strong>${fmtKg(meatStats["소고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["소고기"].amt)}</div></div>
+    <div class="card" onclick="openMeatPurchaseDetail('닭고기')"><small>🐔 닭고기 순구매 / 금액 · 클릭 상세</small><strong>${fmtKg(meatStats["닭고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["닭고기"].amt)}</div></div>
     <div class="card"><small>📦 전체 합계 순구매 / 금액</small><strong>${fmtKg(meatStats["돼지고기"].kg + meatStats["소고기"].kg + meatStats["닭고기"].kg)} KG</strong><div style="font-size:12px;color:#1e40af;margin-top:2px;">₱ ${fmt(meatStats["돼지고기"].amt + meatStats["소고기"].amt + meatStats["닭고기"].amt)}</div></div>
   `;
 
@@ -3763,6 +3955,43 @@ async function loadReport() {
   if (selectedReportProdId) {
     renderReportDetail(selectedReportProdId);
   }
+}
+
+function openMeatPurchaseDetail(meatType) {
+  const start = document.getElementById('rep-start').value;
+  const end = document.getElementById('rep-end').value;
+  const productMap = Object.fromEntries(STATE.products.map(p => [p.id, p.name]));
+  const slabMap = Object.fromEntries(STATE.slabs.map(s => [s.id, s]));
+  const typeLabel = {product_receiving: '상품 구매기록', slab_inbound: '슬랍 원물 구매'};
+  const rows = STATE.movements
+    .filter(m => (m.type === 'product_receiving' || m.type === 'slab_inbound') && m.meat_type === meatType)
+    .filter(m => (!start || (m.date || '').slice(0, 10) >= start) && (!end || (m.date || '').slice(0, 10) <= end))
+    .sort((a, b) => `${b.date}-${b.id}`.localeCompare(`${a.date}-${a.id}`));
+
+  document.getElementById('summary-modal-title').textContent =
+    `[${meatType}] ${start} ~ ${end} 구매 상세 (상품 구매기록은 실재고 미반영)`;
+  const tbody = document.getElementById('summary-modal-body');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#64748b;padding:20px;">해당 기간 구매 내역이 없습니다.</td></tr>';
+  } else {
+    tbody.innerHTML = rows.map(m => {
+      const slab = slabMap[m.slab_id] || {};
+      const target = m.type === 'slab_inbound'
+        ? `슬랍 #${slab.slab_no || m.slab_id} · ${slab.cut || ''}`
+        : (productMap[m.product_id] || '-');
+      return `<tr class="clickable-row" onclick="jumpToEditFromSummary(${m.id}, '${m.type}')">
+        <td>${m.date}</td>
+        <td><span class="badge carry">${typeLabel[m.type]}</span></td>
+        <td><b>${target}</b></td>
+        <td>${m.qty || 0} 팩</td>
+        <td><b>${fmtKg(m.kg_delta || 0)} KG</b></td>
+        <td>₱ ${fmt(m.amount || 0)}</td>
+        <td>${m.note || ''}</td>
+        <td><button class="btn primary" style="padding:3px 8px;font-size:11px;">수정/관리</button></td>
+      </tr>`;
+    }).join('');
+  }
+  document.getElementById('summary-detail-modal').style.display = 'flex';
 }
 
 function renderReportTable() {
